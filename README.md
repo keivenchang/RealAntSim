@@ -1,7 +1,7 @@
-# Pherotrail Lab
+# RealAntSim
 
-A real-time ant colony simulation focused on pheromone trail behavior, with a
-fast native backend running the simulation and a browser-based frontend that
+A real-time ant colony simulation focused on plausible local ant behavior, with
+a fast native backend running the simulation and a browser-based frontend that
 visualizes it live.
 
 ## What it simulates (v1: single colony)
@@ -68,7 +68,7 @@ considered.
 ## Repo layout (planned)
 
 ```
-pherotrail-lab/
+RealAntSim/
 ├── README.md           # this file
 ├── DESIGN.md           # design options + recommended choices
 ├── backend/            # simulation + websocket server
@@ -80,7 +80,7 @@ pherotrail-lab/
 ## Running it
 
 ```bash
-cd pherotrail-lab
+cd RealAntSim
 cargo run --release -p ant-backend
 # open http://localhost:8080  (or http://<host>:8080 from another machine)
 ```

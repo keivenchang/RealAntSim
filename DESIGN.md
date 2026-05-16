@@ -203,7 +203,7 @@ Total frontend: one HTML file, no framework, no build step.
 ## File layout
 
 ```
-pherotrail-lab/
+RealAntSim/
 ├── Cargo.toml                 # workspace root + release profile
 ├── README.md
 ├── DESIGN.md                  # (this file)

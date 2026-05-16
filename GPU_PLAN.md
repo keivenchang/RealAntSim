@@ -195,7 +195,7 @@ ever done, the profile is useful for CPU tuning. After that:
 Feasible. Recommended workspace layout:
 
 ```
-pherotrail-lab/
+RealAntSim/
 ├── Cargo.toml          (workspace)
 ├── ant-core/           (shared lib: World, Brain, scenarios, entities)
 ├── ant-cpu/            (current binary, depends on ant-core)
