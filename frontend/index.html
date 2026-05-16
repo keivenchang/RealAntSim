@@ -1,0 +1,1170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ant Sim v1</title>
+<style>
+  :root {
+    --bg: #0e0a07;
+    --panel: #1a1410;
+    --ground: #2a1f17;
+    --fg: #d8cfc4;
+    --muted: #8a7a6a;
+    --ok: #6c6;
+    --bad: #d55;
+    --accent: #ffaa33;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    box-sizing: border-box;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    display: flex;
+    align-items: stretch;
+    height: 100vh;
+    overflow: hidden;
+    gap: 16px;
+  }
+  /* Layout: graphics column takes all remaining width after the panel.
+     The stage-viewport keeps a strict 16:9 ratio but also caps its width by
+     the available vertical space (so it doesn't waste rows below the chart
+     when the screen is wider than tall, or leave empty width when narrow). */
+  #viz {
+    flex: 1 1 0;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: stretch;
+  }
+  #stage-viewport {
+    position: relative;
+    width: 100%;
+    /* available_height = 100vh - 32 (body padding) - 180 (chart) - 8 (gap) */
+    max-width: calc((100vh - 220px) * 16 / 9);
+    aspect-ratio: 1920 / 1080;
+    margin: 0 auto;
+    overflow: hidden;
+    box-shadow: 0 0 0 1px #000, 0 0 24px rgba(0,0,0,0.6);
+    background: #0a0604;
+  }
+  #stage {
+    position: absolute;
+    top: 0; left: 0;
+    width: 1920px;
+    height: 1080px;
+    transform-origin: top left;
+  }
+  #chart {
+    display: block;
+    width: 100%;
+    max-width: calc((100vh - 220px) * 16 / 9);
+    height: 180px;
+    margin: 0 auto;
+    flex-shrink: 0;
+    background: #14100c;
+    box-shadow: 0 0 0 1px #000;
+  }
+  body { align-items: flex-start; }
+  canvas { display: block; background: var(--ground); }
+  #pher {
+    position: absolute;
+    top: 0; left: 0;
+    /* Pin to #stage's native dimensions explicitly. `width: 100%` was
+       behaving oddly on top of the responsive viewport stack, leaving the
+       canvas at its intrinsic 240×135 bitmap size in the top-left corner. */
+    width: 1920px;
+    height: 1080px;
+    pointer-events: none;
+    mix-blend-mode: screen;
+    opacity: 1.0;
+    image-rendering: auto;
+  }
+  #panel {
+    flex: 0 0 320px;
+    height: 100%;
+    overflow-y: auto;
+    background: var(--panel);
+    padding: 16px;
+    border-left: 1px solid #000;
+    font-size: 12px;
+    box-sizing: border-box;
+  }
+  h1 {
+    font-size: 13px;
+    letter-spacing: 0.1em;
+    margin: 0 0 12px;
+    color: var(--muted);
+  }
+  h2 {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin: 16px 0 6px;
+    text-transform: uppercase;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+    border-bottom: 1px dotted #2a201a;
+  }
+  .row span:first-child { color: var(--muted); }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .ctrls { display: flex; gap: 6px; flex-wrap: wrap; }
+  button {
+    background: #2a201a;
+    color: var(--fg);
+    border: 1px solid #3a2c22;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 5px 9px;
+    cursor: pointer;
+    transition: background 60ms;
+  }
+  button:hover { background: #3a2c22; }
+  button.active {
+    background: var(--accent);
+    color: #1a1410;
+    border-color: var(--accent);
+    font-weight: bold;
+  }
+  label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    cursor: pointer;
+  }
+  input[type=checkbox] { accent-color: var(--accent); }
+  label.slider { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; cursor: default; }
+  label.slider input[type=range] { accent-color: var(--accent); width: 100%; }
+  .legend > div { padding: 2px 0; }
+  .dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    vertical-align: middle;
+    margin-right: 8px;
+    border-radius: 50%;
+  }
+  small { color: var(--muted); display: block; margin-top: 12px; line-height: 1.5; font-size: 11px; }
+  #conn {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--bad);
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  #conn.up { background: var(--ok); }
+  #gameover {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    background: rgba(20, 5, 5, 0.55);
+    color: #ff6a5a;
+    font-weight: bold;
+    letter-spacing: 0.2em;
+    text-shadow: 0 0 12px rgba(255, 60, 40, 0.6);
+    user-select: none;
+  }
+  #gameover.on { display: flex; }
+  #gameover .big { font-size: 28px; }
+  #gameover .small { font-size: 12px; margin-top: 10px; color: #d8a89a; letter-spacing: 0.1em; }
+  #gameover button {
+    margin-top: 22px;
+    background: #ff6a5a;
+    color: #1a0a0a;
+    border: 0;
+    padding: 10px 22px;
+    font-family: inherit;
+    font-size: 13px;
+    letter-spacing: 0.18em;
+    font-weight: bold;
+    cursor: pointer;
+    box-shadow: 0 0 22px rgba(255, 90, 70, 0.5);
+  }
+  #gameover button:hover { background: #ff8a7a; }
+  button.primary {
+    background: var(--accent);
+    color: #1a1410;
+    border-color: var(--accent);
+    font-weight: bold;
+    width: 100%;
+    padding: 8px;
+    margin-top: 6px;
+    letter-spacing: 0.1em;
+  }
+  button.primary:hover { background: #ffc966; }
+</style>
+</head>
+<body>
+<div id="viz">
+  <div id="stage-viewport">
+    <div id="stage">
+      <canvas id="world" width="1920" height="1080"></canvas>
+      <canvas id="pher" width="240" height="135"></canvas>
+    </div>
+    <div id="gameover">
+      <div class="big" id="gameover-title">QUEEN HAS FALLEN</div>
+      <div class="small" id="gameover-reason">simulation halted</div>
+      <button id="restart-big">RESTART</button>
+    </div>
+  </div>
+  <canvas id="chart" width="1280" height="180"></canvas>
+</div>
+
+<div id="panel">
+  <h1>ANT SIM v1</h1>
+
+  <div class="row"><span>conn</span><span><i id="conn"></i><span id="conn-text">...</span></span></div>
+  <div class="row"><span>tick</span><span id="tick">0</span></div>
+  <div class="row"><span>queen</span><span id="queen">?</span></div>
+  <div class="row"><span>queen energy</span><span id="queen-energy">--</span></div>
+  <div class="row"><span>workers</span><span id="workers">0</span></div>
+  <div class="row"><span>soldiers</span><span id="soldiers">0</span></div>
+  <div class="row"><span>food stored</span><span id="food">0</span></div>
+  <div class="row"><span>food in world</span><span id="world-food">0</span></div>
+  <div class="row"><span>piles</span><span id="piles">0</span></div>
+
+  <h2>Speed</h2>
+  <div class="ctrls" id="speed-btns">
+    <button data-speed="0">0×</button>
+    <button data-speed="1">1×</button>
+    <button data-speed="2">2×</button>
+    <button data-speed="5">5×</button>
+    <button data-speed="10">10×</button>
+    <button data-speed="100">100×</button>
+  </div>
+
+  <h2>Food</h2>
+  <label><input type="checkbox" id="respawn"> respawn over time</label>
+  <label class="slider">
+    <span>respawn every:&nbsp;<span id="respawn-val">300</span> ticks (~<span id="respawn-sec">10</span> s @1×)</span>
+    <input type="range" id="respawn-interval" min="60" max="1200" step="30" value="300">
+  </label>
+  <div class="ctrls">
+    <button id="spawn-food">+ spawn pile now</button>
+  </div>
+
+  <h2>Display</h2>
+  <label><input type="checkbox" id="show-pher" checked> show pheromones</label>
+  <label class="slider">
+    <span>pheromone intensity: <output id="pher-intensity-val">0.30</output></span>
+    <input type="range" id="pher-intensity" min="0" max="2" step="0.05" value="0.30">
+  </label>
+  <label><input type="checkbox" id="show-walls" checked> show walls</label>
+  <label><input type="checkbox" id="show-ants" checked> show ants</label>
+
+  <h2>Tools</h2>
+  <div class="ctrls" id="tool-btns">
+    <button data-tool="none" class="active">view</button>
+    <button data-tool="food">+ food</button>
+    <button data-tool="wall">+ wall</button>
+    <button data-tool="erase">− wall</button>
+    <button data-tool="pesticide">☠ pesticide</button>
+  </div>
+  <div class="ctrls" style="margin-top:6px;">
+    <button id="clear-walls">clear all walls</button>
+  </div>
+  <small style="margin-top:6px; font-size:10px;">
+    Food click places a pile; drag sizes it. Walls and pesticide support click+drag.<br>
+    Shift+drag to erase. Walls block ants and pheromones.<br>
+    <br>
+    <b>View:</b> mouse wheel zoom · middle-drag pan · double-click reset · right-click food.
+  </small>
+
+  <h2>Queen</h2>
+  <label class="slider">
+    <span>spawn cooldown:&nbsp;<span id="cooldown-val">30</span> ticks</span>
+    <input type="range" id="cooldown" min="5" max="300" step="5" value="30">
+  </label>
+  <label class="slider">
+    <span>soldier ratio:&nbsp;<span id="ratio-val">0.05</span></span>
+    <input type="range" id="soldier-ratio" min="0" max="1" step="0.05" value="0.05">
+  </label>
+  <label class="slider">
+    <span>max colony:&nbsp;<span id="maxcol-val">2000</span></span>
+    <input type="range" id="maxcol" min="100" max="3000" step="100" value="2000">
+  </label>
+
+  <h2>Chart</h2>
+  <div class="ctrls" id="zoom-btns">
+    <button data-zoom="1">1m</button>
+    <button data-zoom="3">3m</button>
+    <button data-zoom="10">10m</button>
+  </div>
+
+  <h2>Scenarios</h2>
+  <div class="ctrls">
+    <button data-scenario="fresh">fresh</button>
+    <button data-scenario="arc_to_line">arc → line</button>
+    <button data-scenario="wall_test">wall test</button>
+  </div>
+  <small style="font-size:10px; color:var(--muted);">
+    <b>arc → line</b>: pre-painted curved trail. Ants should straighten it.<br>
+    <b>wall test</b>: nest left, food right, vertical wall between with no
+    gap. Ants must form a distinct corridor around the top or bottom of the
+    wall. Success = clear yellow stripe wraps around an end within ~3 min @1×.
+  </small>
+
+  <h2>Game</h2>
+  <button id="restart" class="primary">RESTART</button>
+
+  <h2>Legend</h2>
+  <div class="legend">
+    <div><i class="dot" style="background:#c5499a"></i>queen (stationary, lays eggs)</div>
+    <div><i class="dot" style="background:#cc8a45"></i>worker (searching)</div>
+    <div><i class="dot" style="background:#ffaa33"></i>worker (carrying food)</div>
+    <div><i class="dot" style="background:#dd4a3a"></i>soldier (patrols trails)</div>
+    <div><i class="dot" style="background:#5cc55c"></i>food pile</div>
+    <div><i class="dot" style="background:#7a8acc"></i>nest</div>
+    <div><i class="dot" style="background:#0a0604; border:1px solid #444"></i>wall (impassable)</div>
+  </div>
+
+  <small style="margin-top:8px;">
+    <b>Pheromone overlay colors</b><br>
+    <b style="color:#ffd44a">Yellow</b> = food trail (ants returning with food).<br>
+    <b style="color:#5cc55c">Green</b> = food smell (emitted by food piles).<br>
+    <b style="color:#5a8aff">Blue</b> = home / nest beacon (emitted by nest).<br>
+    <b style="color:#ff3a3a">Red</b> = danger / repellent (dead ends, pesticide,
+    stale trails — ants flee from red).<br>
+    <b style="color:#fff">White</b> = many trails overlap (busy crossroads
+    near nest or food piles).<br>
+    <br>
+    <b>Other</b><br>
+    Ant brightness = current HP (wounded ants fade toward ground).<br>
+    Number on nest = food stored.<br>
+    HP/Energy bars above nest = queen status.<br>
+    Trails take seconds of sim-time to build; bump speed to 10× or 100×.
+  </small>
+</div>
+
+<script>
+const world = document.getElementById('world');
+const wctx = world.getContext('2d');
+const pher = document.getElementById('pher');
+const pctx = pher.getContext('2d');
+const chart = document.getElementById('chart');
+const cctx = chart.getContext('2d');
+const conn = document.getElementById('conn');
+const connText = document.getElementById('conn-text');
+
+// --- Time-series history for the bottom chart ---------------------------
+// Snapshots arrive at ~30 Hz; we hold up to 10 minutes of history.
+const SNAP_HZ = 30;
+const HISTORY_LEN = SNAP_HZ * 60 * 10; // 18,000 samples = 10 min
+const ZOOM_OPTIONS = [
+  { label: '1m',  minutes: 1,  samples: SNAP_HZ * 60 },
+  { label: '3m',  minutes: 3,  samples: SNAP_HZ * 60 * 3 },
+  { label: '10m', minutes: 10, samples: SNAP_HZ * 60 * 10 },
+];
+let currentZoom = ZOOM_OPTIONS[1]; // 3m default
+
+// Each chart row can hold multiple series that share a Y axis (so e.g.
+// workers and soldiers — both ant counts — line up on the same scale).
+const ROWS = [
+  {
+    label: 'ants',
+    floor: 30,
+    series: [
+      { key: 'workers',  color: '#cc8a45', name: 'w' },
+      { key: 'soldiers', color: '#dd4a3a', name: 's' },
+    ],
+  },
+  {
+    label: 'food',
+    floor: 100,
+    series: [
+      { key: 'food_stored',   color: '#5cc55c', name: 'nest' },
+      { key: 'food_in_world', color: '#88aa55', name: 'world' },
+    ],
+  },
+  {
+    label: 'queen NRG',
+    floor: 1.0,
+    series: [{ key: 'queen_energy', color: '#c5499a', name: 'NRG' }],
+  },
+];
+const SERIES = ROWS.flatMap(r => r.series);
+const history = Object.fromEntries(SERIES.map(s => [s.key, []]));
+
+function pushHistory(snap) {
+  history.workers.push(snap.stats.n_workers);
+  history.soldiers.push(snap.stats.n_soldiers);
+  history.food_stored.push(snap.stats.food_stored);
+  history.food_in_world.push(snap.stats.food_in_world);
+  history.queen_energy.push(snap.nest.queen_energy);
+  for (const k in history) {
+    while (history[k].length > HISTORY_LEN) history[k].shift();
+  }
+}
+
+function fmtVal(v) {
+  if (v <= 0) return '0';
+  if (v < 2)  return v.toFixed(2);
+  if (v < 10) return v.toFixed(1);
+  return v.toFixed(0);
+}
+
+function fmtTime(sec) {
+  if (sec >= 60) return (sec / 60).toFixed(0) + 'm';
+  return sec.toFixed(0) + 's';
+}
+
+function drawChart() {
+  // Keep the chart canvas's internal pixel buffer matched to its CSS size,
+  // so the lines stay sharp when the layout responsively resizes.
+  const cssW = chart.clientWidth;
+  if (cssW && Math.abs(chart.width - cssW) > 1) chart.width = cssW;
+  const w = chart.width, h = chart.height;
+  cctx.fillStyle = '#14100c';
+  cctx.fillRect(0, 0, w, h);
+
+  const padLeft = 78;    // room for series label + max value
+  const padRight = 72;   // room for current value(s)
+  const padTop = 4;
+  const padBottom = 16;  // room for X-axis time labels
+  const rowH = (h - padTop - padBottom) / ROWS.length;
+  const plotW = w - padLeft - padRight;
+
+  const window = currentZoom.samples;
+  cctx.font = '10px ui-monospace, monospace';
+  cctx.textBaseline = 'middle';
+
+  for (let ri = 0; ri < ROWS.length; ri++) {
+    const row = ROWS[ri];
+    const rowTop = padTop + ri * rowH;
+    const rowMid = rowTop + rowH / 2;
+    const lineTop = rowTop + 3;
+    const lineBot = rowTop + rowH - 3;
+    const lineH = lineBot - lineTop;
+
+    // Row background stripes for readability
+    cctx.fillStyle = ri % 2 ? '#1a1410' : '#15110d';
+    cctx.fillRect(padLeft, rowTop, plotW, rowH);
+
+    // Row label (left of plot) — use first series color, or white for multi-series
+    cctx.textAlign = 'right';
+    cctx.fillStyle = row.series.length === 1 ? row.series[0].color : '#cfc8c0';
+    cctx.fillText(row.label, padLeft - 6, rowMid);
+
+    // Compute shared Y scale across all series in this row
+    let dmax = row.floor;
+    const sliced = [];
+    for (const s of row.series) {
+      const arr = history[s.key];
+      const start = Math.max(0, arr.length - window);
+      const data = arr.slice(start);
+      sliced.push({ s, data });
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] > dmax) dmax = data[i];
+      }
+    }
+    if (sliced.every(({ data }) => data.length < 2)) continue;
+
+    // Draw each series on the shared scale
+    for (const { s, data } of sliced) {
+      if (data.length < 2) continue;
+      const n = data.length;
+      const step = n / plotW;
+      cctx.strokeStyle = s.color;
+      cctx.lineWidth = 1.4;
+      cctx.beginPath();
+      let started = false;
+      for (let px = 0; px < plotW; px++) {
+        const i0 = Math.floor(px * step);
+        const i1 = Math.min(Math.ceil((px + 1) * step), n);
+        if (i0 >= n) break;
+        let v = data[i0];
+        for (let i = i0 + 1; i < i1; i++) if (data[i] > v) v = data[i];
+        const x = padLeft + px;
+        const y = lineBot - (v / dmax) * lineH;
+        if (!started) { cctx.moveTo(x, y); started = true; }
+        else cctx.lineTo(x, y);
+      }
+      cctx.stroke();
+    }
+
+    // Y-axis: shared max at top, 0 at bottom (dim gray)
+    cctx.textAlign = 'left';
+    cctx.fillStyle = '#6a5b4d';
+    cctx.fillText(fmtVal(dmax), padLeft + 3, lineTop + 3);
+    cctx.fillText('0',          padLeft + 3, lineBot - 3);
+
+    // Current value(s), right of plot, each in its series color.
+    // Multi-series: stack vertically. Single-series: centered.
+    if (row.series.length === 1) {
+      const s = row.series[0];
+      const arr = history[s.key];
+      const cur = arr.length ? arr[arr.length - 1] : 0;
+      cctx.fillStyle = s.color;
+      cctx.textAlign = 'left';
+      cctx.fillText(fmtVal(cur), padLeft + plotW + 4, rowMid);
+    } else {
+      const slots = row.series.length;
+      for (let i = 0; i < slots; i++) {
+        const s = row.series[i];
+        const arr = history[s.key];
+        const cur = arr.length ? arr[arr.length - 1] : 0;
+        const y = rowTop + (rowH / (slots + 1)) * (i + 1);
+        cctx.fillStyle = s.color;
+        cctx.textAlign = 'left';
+        cctx.fillText(`${s.name} ${fmtVal(cur)}`, padLeft + plotW + 4, y);
+      }
+    }
+  }
+
+  // X-axis: time labels under the chart (-window, -window/2, now)
+  cctx.fillStyle = '#8a7a6a';
+  cctx.textBaseline = 'bottom';
+  cctx.textAlign = 'left';
+  const winSec = window / SNAP_HZ;
+  cctx.fillText(`-${fmtTime(winSec)}`,    padLeft + 2,           h - 2);
+  cctx.textAlign = 'center';
+  cctx.fillText(`-${fmtTime(winSec/2)}`,  padLeft + plotW / 2,   h - 2);
+  cctx.textAlign = 'right';
+  cctx.fillText('now',                    padLeft + plotW - 2,   h - 2);
+
+  // Zoom indicator (top-right corner)
+  cctx.textAlign = 'right';
+  cctx.textBaseline = 'top';
+  cctx.fillStyle = '#ffaa33';
+  cctx.font = 'bold 10px ui-monospace, monospace';
+  cctx.fillText('window ' + currentZoom.label, w - 6, 4);
+}
+
+const GROUND = { r: 0x2a, g: 0x1f, b: 0x17 };
+
+// --- Viewport (zoom + pan) -------------------------------------------------
+// FIT_ZOOM is the scale needed to fit the 1920×1080 world inside the
+// current responsive viewport. Recomputed on resize.
+function computeFitZoom() {
+  const vp = document.getElementById('stage-viewport');
+  return vp.clientWidth / 1920;
+}
+let FIT_ZOOM = computeFitZoom();
+let viewZoom = FIT_ZOOM;
+let viewPanX = 0;
+let viewPanY = 0;
+window.addEventListener('resize', () => {
+  const wasFit = Math.abs(viewZoom - FIT_ZOOM) < 0.005;
+  FIT_ZOOM = computeFitZoom();
+  if (wasFit) {
+    viewZoom = FIT_ZOOM;
+    viewPanX = 0;
+    viewPanY = 0;
+  }
+  applyView();
+  // Charts redraw on next frame from render().
+});
+function applyView() {
+  const stage = document.getElementById('stage');
+  stage.style.transform =
+    `translate(${viewPanX}px, ${viewPanY}px) scale(${viewZoom})`;
+}
+function viewportToWorld(clientX, clientY) {
+  const vp = document.getElementById('stage-viewport').getBoundingClientRect();
+  return {
+    x: (clientX - vp.left - viewPanX) / viewZoom,
+    y: (clientY - vp.top - viewPanY) / viewZoom,
+  };
+}
+function setupViewport() {
+  const vp = document.getElementById('stage-viewport');
+  vp.addEventListener('wheel', e => {
+    e.preventDefault();
+    const rect = vp.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    // Zoom toward cursor: keep the world point under the cursor fixed.
+    viewPanX = mx - (mx - viewPanX) * factor;
+    viewPanY = my - (my - viewPanY) * factor;
+    viewZoom = Math.max(0.3, Math.min(viewZoom * factor, 12));
+    applyView();
+  }, { passive: false });
+  // Middle-click drag to pan (left-click is used for walls / food placement).
+  let panning = false, lastX = 0, lastY = 0;
+  vp.addEventListener('mousedown', e => {
+    if (e.button === 1) { e.preventDefault(); panning = true; lastX = e.clientX; lastY = e.clientY; }
+  });
+  vp.addEventListener('mousemove', e => {
+    if (!panning) return;
+    viewPanX += e.clientX - lastX;
+    viewPanY += e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    applyView();
+  });
+  window.addEventListener('mouseup', e => { if (e.button === 1) panning = false; });
+  // Double-click to reset to fit-the-world.
+  vp.addEventListener('dblclick', () => {
+    FIT_ZOOM = computeFitZoom();
+    viewZoom = FIT_ZOOM; viewPanX = 0; viewPanY = 0; applyView();
+  });
+}
+applyView();
+setupViewport();
+
+// --- Display toggles (pheromone / walls / ants visibility) -----------------
+let showPher = true, showWalls = true, showAnts = true;
+let pherIntensity = 0.30;
+document.getElementById('show-pher').addEventListener('change', e => {
+  showPher = e.target.checked;
+  document.getElementById('pher').style.display = showPher ? 'block' : 'none';
+});
+document.getElementById('show-walls').addEventListener('change', e => {
+  showWalls = e.target.checked;
+});
+document.getElementById('show-ants').addEventListener('change', e => {
+  showAnts = e.target.checked;
+});
+document.getElementById('pher-intensity').addEventListener('input', e => {
+  pherIntensity = parseFloat(e.target.value);
+  document.getElementById('pher-intensity-val').textContent = pherIntensity.toFixed(2);
+});
+// Resize the chart canvas internal pixel buffer to match its CSS width
+// each render so it stays crisp at responsive sizes.
+
+function b64ToBytes(s) {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Decode the packed binary ant buffer (matches protocol.rs::ANT_STRIDE = 18).
+const ANT_STRIDE = 18;
+function decodeAnts(b64, n) {
+  const bytes = b64ToBytes(b64);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const o = i * ANT_STRIDE;
+    const role_u = dv.getUint8(o + 13);
+    const flags  = dv.getUint8(o + 14);
+    out[i] = {
+      id: dv.getUint32(o, true),
+      x: dv.getFloat32(o + 4, true),
+      y: dv.getFloat32(o + 8, true),
+      h: (dv.getUint8(o + 12) / 256) * Math.PI * 2,
+      r: role_u === 0 ? 'Q' : role_u === 1 ? 'W' : 'S',
+      c: !!(flags & 1),
+      hp: dv.getUint8(o + 15) / 255,
+      colony: dv.getUint8(o + 16),
+    };
+  }
+  return out;
+}
+
+// Draw an oriented ant: thorax + abdomen + head + two antennae. Coordinates
+// in world space; heading is radians. `scale` multiplies the body size.
+function drawAnt(ctx, x, y, heading, scale, color, isQueen) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(heading);
+  ctx.fillStyle = color;
+  // Abdomen (rear oval) — bigger for queens.
+  const abdomenLen = isQueen ? 3.4 * scale : 2.0 * scale;
+  const abdomenRad = isQueen ? 2.2 * scale : 1.2 * scale;
+  ctx.beginPath();
+  ctx.ellipse(-1.6 * scale, 0, abdomenLen, abdomenRad, 0, 0, 6.28318);
+  ctx.fill();
+  // Thorax (middle).
+  ctx.beginPath();
+  ctx.ellipse(0.3 * scale, 0, 1.0 * scale, 0.8 * scale, 0, 0, 6.28318);
+  ctx.fill();
+  // Head (front circle).
+  ctx.beginPath();
+  ctx.arc(1.7 * scale, 0, 0.9 * scale, 0, 6.28318);
+  ctx.fill();
+  // Antennae — two thin lines splaying forward.
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 0.4 * scale;
+  ctx.beginPath();
+  ctx.moveTo(2.0 * scale, -0.4 * scale);
+  ctx.lineTo(3.4 * scale, -1.4 * scale);
+  ctx.moveTo(2.0 * scale, 0.4 * scale);
+  ctx.lineTo(3.4 * scale, 1.4 * scale);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBar(ctx, x, y, w, h, frac, fillColor, bgColor) {
+  const f = Math.max(0, Math.min(1, frac));
+  ctx.fillStyle = bgColor;
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = fillColor;
+  ctx.fillRect(x, y, w * f, h);
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = 0.5;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+}
+
+let ws = null;
+let frame = null;
+
+function setConn(up, text) {
+  conn.classList.toggle('up', up);
+  connText.textContent = text;
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function connect() {
+  setConn(false, 'connecting');
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => setConn(true, 'connected');
+  ws.onmessage = (e) => {
+    const j = JSON.parse(e.data);
+    // Inflate the packed ant buffer once per snapshot so the rest of the
+    // render code can use `s.ants` exactly as it did with the JSON format.
+    j.ants = decodeAnts(j.ants_packed, j.n_ants);
+    frame = j;
+  };
+  ws.onclose = () => { setConn(false, 'reconnecting'); setTimeout(connect, 750); };
+  ws.onerror = () => ws.close();
+}
+connect();
+
+function syncSpeedButtons(paused, speedMult) {
+  document.querySelectorAll('#speed-btns button').forEach(btn => {
+    const speed = +btn.dataset.speed;
+    btn.classList.toggle('active', paused ? speed === 0 : speed === speedMult);
+  });
+}
+
+// Controls
+document.querySelectorAll('#speed-btns button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const speed = +btn.dataset.speed;
+    const paused = !!frame?.config?.paused;
+    const currentSpeed = frame?.config?.speed_mult ?? 1;
+    if (speed === 0) {
+      if (!paused) {
+        send({ op: 'toggle_pause' });
+      }
+      syncSpeedButtons(true, currentSpeed);
+      return;
+    }
+    send({ op: 'set_speed', value: speed });
+    if (paused) {
+      send({ op: 'toggle_pause' });
+    }
+    // Optimistically highlight — don't wait for the next snapshot.
+    syncSpeedButtons(false, speed);
+  });
+});
+document.querySelectorAll('#zoom-btns button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const mins = +btn.dataset.zoom;
+    const found = ZOOM_OPTIONS.find(z => z.minutes === mins);
+    if (found) {
+      currentZoom = found;
+      document.querySelectorAll('#zoom-btns button').forEach(b => {
+        b.classList.toggle('active', b === btn);
+      });
+    }
+  });
+});
+// Initialize active zoom button
+document.querySelector('#zoom-btns button[data-zoom="3"]')?.classList.add('active');
+document.getElementById('respawn').addEventListener('change', (e) => {
+  send({ op: 'set_respawn', value: e.target.checked });
+});
+
+const riEl = document.getElementById('respawn-interval');
+const riValEl = document.getElementById('respawn-val');
+const riSecEl = document.getElementById('respawn-sec');
+riEl.addEventListener('input', e => {
+  riValEl.textContent = e.target.value;
+  riSecEl.textContent = (+e.target.value / 30).toFixed(1);
+});
+riEl.addEventListener('change', e => {
+  send({ op: 'set_respawn_interval', value: +e.target.value });
+});
+
+const cdEl = document.getElementById('cooldown');
+const cdValEl = document.getElementById('cooldown-val');
+cdEl.addEventListener('input', e => { cdValEl.textContent = e.target.value; });
+cdEl.addEventListener('change', e => {
+  send({ op: 'set_spawn_cooldown', value: +e.target.value });
+});
+
+const rEl = document.getElementById('soldier-ratio');
+const rValEl = document.getElementById('ratio-val');
+rEl.addEventListener('input', e => { rValEl.textContent = (+e.target.value).toFixed(2); });
+rEl.addEventListener('change', e => {
+  send({ op: 'set_soldier_ratio', value: +e.target.value });
+});
+
+const mxEl = document.getElementById('maxcol');
+const mxValEl = document.getElementById('maxcol-val');
+mxEl.addEventListener('input', e => { mxValEl.textContent = e.target.value; });
+mxEl.addEventListener('change', e => {
+  send({ op: 'set_max_colony_size', value: +e.target.value });
+});
+
+document.getElementById('spawn-food').addEventListener('click', () => {
+  send({ op: 'spawn_food' });
+});
+
+// --- Mouse tool selector ---------------------------------------------
+// Tools: none | food | wall | erase | pesticide.
+// Left-click + drag in the canvas applies the current tool.
+// Right-click is a shortcut for "drop food" regardless of selected tool.
+let currentTool = 'none';
+let painting = false;
+const TOOL_RADIUS = { wall: 12, erase: 14, pesticide: 40 };
+const TOOL_CURSOR = { none: '', food: 'crosshair', wall: 'crosshair',
+                      erase: 'crosshair', pesticide: 'crosshair' };
+const vpEl = document.getElementById('stage-viewport');
+const FOOD_DEFAULT_AMOUNT = 60;
+const FOOD_MAX_AMOUNT = 5000;
+const FOOD_MIN_DRAG_RADIUS = 8;
+const FOOD_MAX_RADIUS = Math.sqrt(FOOD_MAX_AMOUNT) * 0.7;
+let foodDrag = null;
+document.querySelectorAll('#tool-btns button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentTool = btn.dataset.tool;
+    document.querySelectorAll('#tool-btns button').forEach(b => {
+      b.classList.toggle('active', b === btn);
+    });
+    vpEl.style.cursor = TOOL_CURSOR[currentTool] || '';
+  });
+});
+
+function applyTool(e) {
+  if (currentTool === 'none') return;
+  const w = viewportToWorld(e.clientX, e.clientY);
+  switch (currentTool) {
+    case 'food':
+      send({ op: 'place_food_at', x: w.x, y: w.y });
+      break;
+    case 'wall':
+      send({ op: 'add_wall', x: w.x, y: w.y, radius: TOOL_RADIUS.wall });
+      break;
+    case 'erase':
+      send({ op: 'remove_wall', x: w.x, y: w.y, radius: TOOL_RADIUS.erase });
+      break;
+    case 'pesticide':
+      send({ op: 'spray_pesticide', x: w.x, y: w.y, radius: TOOL_RADIUS.pesticide });
+      break;
+  }
+}
+
+function foodDragRadius() {
+  if (!foodDrag) return Math.sqrt(FOOD_DEFAULT_AMOUNT) * 0.7;
+  const dx = foodDrag.current.x - foodDrag.start.x;
+  const dy = foodDrag.current.y - foodDrag.start.y;
+  const r = Math.hypot(dx, dy);
+  if (r < FOOD_MIN_DRAG_RADIUS) return Math.sqrt(FOOD_DEFAULT_AMOUNT) * 0.7;
+  return Math.min(r, FOOD_MAX_RADIUS);
+}
+
+function foodAmountFromRadius(radius) {
+  return Math.max(
+    FOOD_DEFAULT_AMOUNT,
+    Math.min(FOOD_MAX_AMOUNT, Math.round((radius / 0.7) ** 2)),
+  );
+}
+
+function placeFoodAt(w, amount = null) {
+  const cmd = { op: 'place_food_at', x: w.x, y: w.y };
+  if (amount !== null) cmd.amount = amount;
+  send(cmd);
+}
+
+const stageEl = document.getElementById('stage');
+vpEl.addEventListener('mousedown', e => {
+  if (e.button !== 0 || currentTool === 'none') return;
+  e.preventDefault();
+  if (currentTool === 'food') {
+    const w = viewportToWorld(e.clientX, e.clientY);
+    foodDrag = { start: w, current: w };
+    painting = false;
+    return;
+  }
+  applyTool(e);
+  painting = true;
+});
+vpEl.addEventListener('mousemove', e => {
+  if (foodDrag) {
+    foodDrag.current = viewportToWorld(e.clientX, e.clientY);
+    return;
+  }
+  if (painting) applyTool(e);
+});
+window.addEventListener('mouseup', e => {
+  if (foodDrag) {
+    foodDrag.current = viewportToWorld(e.clientX, e.clientY);
+    const dx = foodDrag.current.x - foodDrag.start.x;
+    const dy = foodDrag.current.y - foodDrag.start.y;
+    const dragDist = Math.hypot(dx, dy);
+    if (dragDist < FOOD_MIN_DRAG_RADIUS) {
+      placeFoodAt(foodDrag.start);
+    } else {
+      placeFoodAt(foodDrag.start, foodAmountFromRadius(foodDragRadius()));
+    }
+    foodDrag = null;
+  }
+  painting = false;
+});
+
+document.getElementById('clear-walls').addEventListener('click', () => {
+  if (confirm('Clear all walls?')) send({ op: 'clear_walls' });
+});
+
+// Right-click anywhere on the canvas drops a food pile (shortcut).
+vpEl.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  const w = viewportToWorld(e.clientX, e.clientY);
+  placeFoodAt(w);
+});
+
+function restart() {
+  // No confirm when the queen is dead — it's clearly the desired action.
+  // Confirm only if the colony is still alive (the user might mis-click).
+  const alive = frame && frame.running;
+  if (alive && !confirm('Restart the game? Current colony will be wiped.')) return;
+  send({ op: 'reset' });
+}
+document.getElementById('restart').addEventListener('click', restart);
+document.getElementById('restart-big').addEventListener('click', restart);
+
+// Scenario loader buttons.
+document.querySelectorAll('[data-scenario]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    send({ op: 'load_scenario', name: btn.dataset.scenario });
+  });
+});
+
+function syncControls(s) {
+  // Speed buttons
+  syncSpeedButtons(s.config.paused, s.config.speed_mult);
+  // Respawn checkbox (only if user isn't mid-interaction)
+  const r = document.getElementById('respawn');
+  if (r !== document.activeElement) r.checked = s.config.food_respawn;
+  // Queen sliders
+  if (cdEl !== document.activeElement) {
+    cdEl.value = s.config.spawn_cooldown_ticks;
+    cdValEl.textContent = s.config.spawn_cooldown_ticks;
+  }
+  if (rEl !== document.activeElement) {
+    rEl.value = s.config.soldier_ratio;
+    rValEl.textContent = (+s.config.soldier_ratio).toFixed(2);
+  }
+  if (mxEl !== document.activeElement) {
+    mxEl.value = s.config.max_colony_size;
+    mxValEl.textContent = s.config.max_colony_size;
+  }
+  if (riEl !== document.activeElement) {
+    riEl.value = s.config.food_respawn_interval_ticks;
+    riValEl.textContent = s.config.food_respawn_interval_ticks;
+    riSecEl.textContent = (s.config.food_respawn_interval_ticks / 30).toFixed(1);
+  }
+}
+
+function render() {
+  requestAnimationFrame(render);
+  if (!frame) return;
+  const s = frame;
+
+  if (world.width !== s.width || world.height !== s.height) {
+    world.width = s.width;
+    world.height = s.height;
+  }
+  if (pher.width !== s.pher_cols || pher.height !== s.pher_rows) {
+    pher.width = s.pher_cols;
+    pher.height = s.pher_rows;
+  }
+
+  // Pheromone overlay (new palette — repellent now reads as pure danger red):
+  //   yellow (R+G)  = food trail   (ants returning with food)
+  //   green  (G)    = food smell   (emitted by food piles)
+  //   blue   (B)    = home trail   (outbound ants)
+  //   red    (R)    = repellent    (danger / pesticide / dead ends)
+  const pf = b64ToBytes(s.pher_food);
+  const ph = b64ToBytes(s.pher_home);
+  const ps = b64ToBytes(s.pher_smell);
+  const pr = b64ToBytes(s.pher_repel);
+  const img = pctx.createImageData(s.pher_cols, s.pher_rows);
+  // pheromone intensity multiplier (0 = invisible, 1 = normal, 2 = boosted)
+  const pi = pherIntensity;
+  for (let i = 0; i < pf.length; i++) {
+    const f = pf[i] * pi;
+    const h = ph[i] * pi;
+    const sm = ps[i] * pi;
+    const re = pr[i] * pi;
+    const m = Math.max(f, Math.max(h, Math.max(sm, re)));
+    // Food → yellow (R+G), smell → green, home → blue. Repellent renders
+    // as a smooth gradient blending all colors toward PURE BLACK as
+    // concentration rises. At peak pesticide → (0,0,0) full opaque. As
+    // the cloud diffuses / decays → fades through dark red → faint red
+    // → transparent at re≈0. No hard cutoff threshold.
+    const pestFactor = Math.min(1, re / 200);
+    const baseR = f * 1.3 + re * 1.5;
+    const baseG = f * 1.1 + sm * 1.5;
+    const baseB = h * 1.7;
+    const baseA = m * 1.6;
+    // Lerp final RGB toward (0,0,0) by pestFactor — peak pest = pure black.
+    img.data[i*4 + 0] = Math.min(255, baseR * (1 - pestFactor));
+    img.data[i*4 + 1] = Math.min(255, baseG * (1 - pestFactor));
+    img.data[i*4 + 2] = Math.min(255, baseB * (1 - pestFactor));
+    // Alpha = max(normal channel alpha, pesticide opacity).
+    img.data[i*4 + 3] = Math.min(255, Math.max(baseA, 255 * pestFactor));
+  }
+  pctx.putImageData(img, 0, 0);
+
+  // Ground
+  wctx.fillStyle = '#2a1f17';
+  wctx.fillRect(0, 0, s.width, s.height);
+
+  // Walls (dark brown blocks)
+  if (showWalls && s.walls) {
+    const wb = b64ToBytes(s.walls);
+    const cs = s.wall_cell_size;
+    wctx.fillStyle = '#0a0604';
+    for (let r = 0; r < s.wall_rows; r++) {
+      const rowBase = r * s.wall_cols;
+      for (let c = 0; c < s.wall_cols; c++) {
+        if (wb[rowBase + c]) wctx.fillRect(c * cs, r * cs, cs, cs);
+      }
+    }
+  }
+
+  // Corpses (dead ants).
+  //   Poisoned (pesticide death) → pure BLACK throughout decomposition
+  //   (toxin doesn't go away; corpse stays a hazard until removed).
+  //   Natural death → brown when fresh, fading toward food-green as it
+  //   decomposes into the same green food pile color.
+  if (s.corpses) {
+    for (const c of s.corpses) {
+      if (c.poisoned) {
+        wctx.fillStyle = 'rgb(0,0,0)';
+      } else {
+        const t = c.fresh;
+        const r = Math.round(0x33 * t + 0x5c * (1 - t));
+        const g = Math.round(0x22 * t + 0xc5 * (1 - t));
+        const b = Math.round(0x18 * t + 0x5c * (1 - t));
+        wctx.fillStyle = `rgb(${r},${g},${b})`;
+      }
+      wctx.beginPath(); wctx.arc(c.x, c.y, 1.8, 0, 6.28318); wctx.fill();
+    }
+  }
+
+  // Food
+  for (const f of s.food) {
+    const r = Math.max(2, Math.sqrt(f.amount) * 0.7);
+    wctx.fillStyle = '#5cc55c';
+    wctx.beginPath(); wctx.arc(f.x, f.y, r, 0, 6.28318); wctx.fill();
+  }
+  if (foodDrag) {
+    const r = foodDragRadius();
+    wctx.fillStyle = 'rgba(92, 197, 92, 0.22)';
+    wctx.strokeStyle = '#9dff9d';
+    wctx.lineWidth = 2;
+    wctx.beginPath(); wctx.arc(foodDrag.start.x, foodDrag.start.y, r, 0, 6.28318);
+    wctx.fill(); wctx.stroke();
+  }
+
+  // Nest disk
+  wctx.fillStyle = '#7a8acc';
+  wctx.beginPath(); wctx.arc(s.nest.x, s.nest.y, s.nest.radius, 0, 6.28318); wctx.fill();
+
+  // Queen status panel above the nest: two bars (HP red, energy gold)
+  // plus food-stored / spawn-cooldown text. Anchored above the nest so you
+  // can see colony health at a glance without taking your eye off the world.
+  if (s.nest.queen_alive) {
+    const px = s.nest.x;
+    const py = s.nest.y - s.nest.radius - 22;
+    const barW = 56, barH = 4, gap = 2;
+    // backplate for legibility
+    wctx.fillStyle = 'rgba(0,0,0,0.55)';
+    wctx.fillRect(px - barW/2 - 4, py - 14, barW + 8, 30);
+    // HP bar
+    drawBar(wctx, px - barW/2, py - 10, barW, barH, s.nest.queen_hp, '#dd4a3a', '#3a1818');
+    // Energy bar
+    drawBar(wctx, px - barW/2, py - 10 + barH + gap, barW, barH, s.nest.queen_energy, '#ffaa33', '#3a2918');
+    // Labels
+    wctx.fillStyle = '#ddd';
+    wctx.font = 'bold 9px ui-monospace, monospace';
+    wctx.textAlign = 'left';
+    wctx.fillText('HP', px - barW/2 - 18, py - 6);
+    wctx.fillText('EN', px - barW/2 - 18, py - 6 + barH + gap);
+    wctx.textAlign = 'right';
+    wctx.fillStyle = '#ffe0a0';
+    wctx.fillText((s.nest.queen_energy * 100).toFixed(0) + '%', px + barW/2 + 18, py - 6 + barH + gap);
+  }
+
+  // Stored-food number, centered on the nest itself
+  wctx.fillStyle = '#fff';
+  wctx.font = 'bold 11px ui-monospace, monospace';
+  wctx.textAlign = 'center';
+  wctx.fillText(s.nest.food_stored.toFixed(0), s.nest.x, s.nest.y + 4);
+
+  // Ants — drawn as oriented body + head + antennae, johnBuffer-style.
+  // HP controls brightness (a wounded ant fades toward the ground).
+  if (showAnts) for (const a of s.ants) {
+    let baseR, baseG, baseB, scale;
+    if (a.r === 'Q')      { baseR=0xc5; baseG=0x49; baseB=0x9a; scale=2.0; }
+    else if (a.r === 'S') { baseR=0xdd; baseG=0x4a; baseB=0x3a; scale=2.0; }
+    else if (a.c)         { baseR=0xff; baseG=0xaa; baseB=0x33; scale=1.0; }
+    else                  { baseR=0xcc; baseG=0x8a; baseB=0x45; scale=1.0; }
+    const t = Math.max(0.18, Math.min(1, a.hp));
+    const r = Math.round(GROUND.r + (baseR - GROUND.r) * t);
+    const g = Math.round(GROUND.g + (baseG - GROUND.g) * t);
+    const b = Math.round(GROUND.b + (baseB - GROUND.b) * t);
+    drawAnt(wctx, a.x, a.y, a.h, scale, `rgb(${r},${g},${b})`, a.r === 'Q');
+  }
+
+  // Panel
+  document.getElementById('tick').textContent = s.tick;
+  document.getElementById('queen').innerHTML = s.nest.queen_alive
+    ? '<span class="ok">alive</span>'
+    : '<span class="bad">DEAD</span>';
+  const qe = s.nest.queen_energy;
+  const qeEl = document.getElementById('queen-energy');
+  qeEl.textContent = s.nest.queen_alive ? (qe * 100).toFixed(0) + '%' : '--';
+  qeEl.className = !s.nest.queen_alive ? 'bad' : qe > 0.5 ? 'ok' : qe > 0.2 ? '' : 'bad';
+  document.getElementById('workers').textContent = s.stats.n_workers;
+  document.getElementById('soldiers').textContent = s.stats.n_soldiers;
+  document.getElementById('food').textContent = s.stats.food_stored.toFixed(1);
+  document.getElementById('world-food').textContent = s.stats.food_in_world.toFixed(0);
+  document.getElementById('piles').textContent = s.food.length;
+  document.getElementById('gameover').classList.toggle('on', !s.running);
+  // Hide the chart entirely on colony collapse — hard stop, no more data.
+  document.getElementById('chart').style.display = s.running ? 'block' : 'none';
+  if (!s.running) {
+    const titleEl = document.getElementById('gameover-title');
+    const reasonEl = document.getElementById('gameover-reason');
+    if (!s.nest.queen_alive) {
+      titleEl.textContent = 'QUEEN HAS FALLEN';
+      reasonEl.textContent = 'the colony has no future';
+    } else {
+      titleEl.textContent = 'COLONY COLLAPSED';
+      reasonEl.textContent = 'no workers or soldiers remain';
+    }
+  }
+  syncControls(s);
+
+  // Freeze chart history at collapse — no more samples appended.
+  if (s.running) {
+    pushHistory(s);
+    drawChart();
+  }
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

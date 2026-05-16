@@ -1,0 +1,9 @@
+target/
+.DS_Store
+*.swp
+*.log
+*.pid
+
+# Local runtime output
+run/
+*_dump.png
