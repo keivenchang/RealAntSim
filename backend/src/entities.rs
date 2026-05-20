@@ -47,9 +47,8 @@ pub struct Food {
     pub amount: f32,
 }
 
-/// A dead ant's body. Acts as a soft obstacle for a while, then decomposes
-/// into a small food pile at the same spot. Models the real-ant "midden
-/// pile" → nutrient recycling loop.
+/// A corpse marker kept for protocol compatibility. Normal ant deaths remove
+/// the ant immediately and do not create one.
 pub struct Corpse {
     pub pos: Vec2,
     pub ticks_remaining: u32,

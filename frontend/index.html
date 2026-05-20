@@ -134,6 +134,15 @@
     border-color: var(--accent);
     font-weight: bold;
   }
+  select {
+    width: 100%;
+    background: #2a201a;
+    color: var(--fg);
+    border: 1px solid #3a2c22;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 5px 8px;
+  }
   label {
     display: flex;
     align-items: center;
@@ -245,6 +254,16 @@
     <button data-speed="100">100×</button>
   </div>
 
+  <h2>Brain</h2>
+  <label>
+    <span>worker brain</span>
+    <select id="worker-brain">
+      <option value="classic">classic</option>
+      <option value="weighted">weighted</option>
+      <option value="neural">neural</option>
+    </select>
+  </label>
+
   <h2>Food</h2>
   <label><input type="checkbox" id="respawn"> respawn over time</label>
   <label class="slider">
@@ -305,15 +324,16 @@
 
   <h2>Scenarios</h2>
   <div class="ctrls">
-    <button data-scenario="fresh">fresh</button>
-    <button data-scenario="arc_to_line">arc → line</button>
-    <button data-scenario="wall_test">wall test</button>
+    <button data-scenario="visual_wall_test">wall route</button>
+    <button data-scenario="visual_arc_to_line">arc → line</button>
+    <button data-scenario="visual_multi_path">multi path</button>
+    <button data-scenario="visual_food_cycle">food cycle</button>
+    <button data-scenario="visual_lost_carrier">lost carrier</button>
+    <button data-scenario="visual_cluster_escape">cluster escape</button>
   </div>
   <small style="font-size:10px; color:var(--muted);">
-    <b>arc → line</b>: pre-painted curved trail. Ants should straighten it.<br>
-    <b>wall test</b>: nest left, food right, vertical wall between with no
-    gap. Ants must form a distinct corridor around the top or bottom of the
-    wall. Success = clear yellow stripe wraps around an end within ~3 min @1×.
+    Inspectable bench previews only. Each one starts with visible food, walls,
+    trails, or an active carrier problem. Barren/no-food setups are hidden.
   </small>
 
   <h2>Game</h2>
@@ -783,6 +803,11 @@ document.getElementById('respawn').addEventListener('change', (e) => {
   send({ op: 'set_respawn', value: e.target.checked });
 });
 
+const brainEl = document.getElementById('worker-brain');
+brainEl.addEventListener('change', e => {
+  send({ op: 'set_worker_brain', value: e.target.value });
+});
+
 const riEl = document.getElementById('respawn-interval');
 const riValEl = document.getElementById('respawn-val');
 const riSecEl = document.getElementById('respawn-sec');
@@ -973,6 +998,9 @@ function syncControls(s) {
     riValEl.textContent = s.config.food_respawn_interval_ticks;
     riSecEl.textContent = (s.config.food_respawn_interval_ticks / 30).toFixed(1);
   }
+  if (brainEl !== document.activeElement && s.config.worker_brain) {
+    brainEl.value = s.config.worker_brain;
+  }
 }
 
 function render() {
@@ -1043,20 +1071,21 @@ function render() {
     }
   }
 
-  // Corpses (dead ants).
+  // Corpses. Current gameplay removes dead ants immediately; this renderer
+  // remains for protocol compatibility with manually supplied corpse records.
   //   Poisoned (pesticide death) → pure BLACK throughout decomposition
   //   (toxin doesn't go away; corpse stays a hazard until removed).
-  //   Natural death → brown when fresh, fading toward food-green as it
-  //   decomposes into the same green food pile color.
+  //   Natural death → brown corpse marker. It disappears after decomposition;
+  //   dead ants no longer create Food objects.
   if (s.corpses) {
     for (const c of s.corpses) {
       if (c.poisoned) {
         wctx.fillStyle = 'rgb(0,0,0)';
       } else {
         const t = c.fresh;
-        const r = Math.round(0x33 * t + 0x5c * (1 - t));
-        const g = Math.round(0x22 * t + 0xc5 * (1 - t));
-        const b = Math.round(0x18 * t + 0x5c * (1 - t));
+        const r = Math.round(0x5a * t + 0x35 * (1 - t));
+        const g = Math.round(0x3b * t + 0x28 * (1 - t));
+        const b = Math.round(0x22 * t + 0x18 * (1 - t));
         wctx.fillStyle = `rgb(${r},${g},${b})`;
       }
       wctx.beginPath(); wctx.arc(c.x, c.y, 1.8, 0, 6.28318); wctx.fill();

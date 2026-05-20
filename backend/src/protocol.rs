@@ -2,9 +2,9 @@
 //! so it's easy to debug in DevTools. Switch to a packed binary in v2 if
 //! bandwidth becomes a concern.
 
-use crate::brain::PheromoneChannel;
+use crate::brain::{PheromoneChannel, WorkerBrainKind};
 use crate::entities::Role;
-use crate::world::World;
+use crate::world::{World, CORPSE_DECOMPOSE_TICKS};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::Serialize;
@@ -91,6 +91,14 @@ pub struct ConfigDto {
     pub soldier_ratio: f32,
     pub max_colony_size: u32,
     pub paused: bool,
+    pub worker_brain: WorkerBrainKind,
+    pub perception_position_noise: f32,
+    pub perception_heading_noise: f32,
+    pub perception_signal_noise: f32,
+    pub motor_speed_noise: f32,
+    pub motor_turn_noise: f32,
+    pub deposit_strength_noise: f32,
+    pub deposit_position_noise: f32,
 }
 
 #[derive(Serialize)]
@@ -164,7 +172,7 @@ pub fn snapshot(w: &World) -> Snapshot {
         .map(|c| CorpseDto {
             x: c.pos.x,
             y: c.pos.y,
-            fresh: (c.ticks_remaining as f32 / 18000.0).clamp(0.0, 1.0),
+            fresh: (c.ticks_remaining as f32 / CORPSE_DECOMPOSE_TICKS as f32).clamp(0.0, 1.0),
             poisoned: c.poisoned,
         })
         .collect();
@@ -244,6 +252,36 @@ pub fn snapshot(w: &World) -> Snapshot {
             soldier_ratio: w.config.soldier_ratio,
             max_colony_size: w.config.max_colony_size,
             paused: w.config.paused,
+            worker_brain: w.config.worker_brain_kind,
+            perception_position_noise: w.config.perception_position_noise,
+            perception_heading_noise: w.config.perception_heading_noise,
+            perception_signal_noise: w.config.perception_signal_noise,
+            motor_speed_noise: w.config.motor_speed_noise,
+            motor_turn_noise: w.config.motor_turn_noise,
+            deposit_strength_noise: w.config.deposit_strength_noise,
+            deposit_position_noise: w.config.deposit_position_noise,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::Corpse;
+    use glam::Vec2;
+
+    #[test]
+    fn corpse_freshness_uses_actual_decompose_lifetime() {
+        let mut world = World::new(640.0, 480.0);
+        world.corpses.push(Corpse {
+            pos: Vec2::new(120.0, 90.0),
+            ticks_remaining: CORPSE_DECOMPOSE_TICKS,
+            poisoned: false,
+        });
+
+        let snap = snapshot(&world);
+
+        assert_eq!(snap.corpses.len(), 1);
+        assert!((snap.corpses[0].fresh - 1.0).abs() < f32::EPSILON);
     }
 }

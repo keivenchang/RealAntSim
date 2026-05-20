@@ -3,14 +3,50 @@
 //! The sim builds a `Perception` for the ant, the brain returns a `Vec<Action>`,
 //! the sim applies the actions. Brains hold their own per-ant state.
 //!
-//! Adding a new behavior = implement `Brain` and register it in
-//! `World::spawn_ant`. To swap rule-based for a neural net later: write
-//! `NnBrain { net: SmallNet }` that flattens `Perception` to a fixed-size float
-//! input vector and decodes the output back to `Action`s. No sim changes needed.
+//! Adding a new worker behavior = implement `Brain`, add a `WorkerBrainKind`
+//! variant, and register it in `brains::make_worker_brain`. To swap rule-based
+//! for a neural net later: write `NnBrain { net: SmallNet }` that flattens
+//! `Perception` to a fixed-size float input vector and decodes the output back
+//! to `Action`s. No sim changes needed.
 
 use crate::entities::{EntityId, Role};
 use glam::Vec2;
 use rand::rngs::SmallRng;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerBrainKind {
+    /// Current tuned johnBuffer-style 3-sensor worker brain. This stays the
+    /// default so existing benches remain anchored to the known baseline.
+    #[default]
+    Classic,
+    /// Experimental weighted-vector worker brain. Kept selectable so we can
+    /// compare a more parameterized method without disturbing Classic.
+    Weighted,
+    /// Experimental tiny-MLP worker brain. It loads local prototype weights
+    /// when available and falls back to `weighted` when not.
+    Neural,
+}
+
+impl WorkerBrainKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkerBrainKind::Classic => "classic",
+            WorkerBrainKind::Weighted => "weighted",
+            WorkerBrainKind::Neural => "neural",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "classic" => Some(WorkerBrainKind::Classic),
+            "weighted" => Some(WorkerBrainKind::Weighted),
+            "neural" => Some(WorkerBrainKind::Neural),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum PheromoneChannel {
@@ -48,12 +84,15 @@ pub struct ForwardSample {
     pub food: f32,
     pub repellent: f32,
     pub home: f32,
+    pub wall: bool,
 }
 
 pub struct Perception {
     pub self_id: EntityId,
     pub self_pos: Vec2,
     pub self_heading: f32,
+    pub world_width: f32,
+    pub world_height: f32,
     pub self_colony: u8,
     pub carrying_food: bool,
     pub pickup_home_dist: f32,
@@ -63,6 +102,18 @@ pub struct Perception {
     pub at_nest: bool,
     pub nest_pos: Vec2,
     pub colony_food: f32,
+    /// Number of active food piles in the world. This is used only as a
+    /// coarse colony context: no-food worlds favor exploration/declumping,
+    /// while food-present worlds prioritize route formation.
+    pub food_piles: u32,
+    /// True when a wall map has had multiple simultaneous food piles. In
+    /// that case FoodSmell plumes can overlap into a basin, so wall brains
+    /// should trust trails more than smell.
+    pub multi_food_wall_context: bool,
+    /// True when the ant is in the active food-side wall pocket that can
+    /// trap workers into a visible clump. FoodSmell is present there, but it
+    /// should not be treated as route evidence.
+    pub near_food_wall_pocket: bool,
     pub nearby_food: Vec<(Vec2, f32)>, // (pos, amount), within perception radius
     pub nearby_ants: Vec<NearbyAnt>,   // within perception radius, excludes self
     pub gradient_to_food: Vec2,        // unit vector toward higher Food pheromone (or zero)
@@ -82,6 +133,9 @@ pub struct Perception {
     /// True if there's a wall in the cell immediately ahead of the ant.
     /// Brains can use this to avoid heading straight into static obstacles.
     pub wall_ahead: bool,
+    /// True when the current world has static obstacles. This lets brains
+    /// choose wall-specific memory policy without probing global geometry.
+    pub has_walls: bool,
     /// johnBuffer-style 3-sensor probe: left/center/right at a fixed
     /// distance ahead of the ant. Brain picks the highest-pheromone
     /// sensor and turns toward it. Simpler and tighter than the 16-ray
@@ -119,6 +173,10 @@ pub struct Perception {
 pub enum Action {
     /// Set absolute heading (radians). Sim clamps angular wrap.
     SetHeading(f32),
+    /// Set both current and target heading. Used sparingly for local-memory
+    /// evasive turns where waiting for the steering controller would preserve
+    /// an implausible direct dash for several frames.
+    SetHeadingImmediate(f32),
     /// Move forward at this speed (units/tick), clamped by sim.
     Forward(f32),
     PickupFood,

@@ -65,6 +65,10 @@ and pheromone fields with WebGL2 instanced draws, so 50k+ entities stay
 smooth. See `DESIGN.md` for the choices behind this and the alternatives we
 considered.
 
+For related ant, pheromone, and neural-swarm projects that informed the current
+direction, see `DESIGN.md` under "Related Work And Ideas". For the scored
+behavior gates, see `BENCHMARK.md`.
+
 ## Repo layout (planned)
 
 ```
@@ -101,6 +105,10 @@ by the same process.
   nest.
 - **Reset world.** Wipes ants, food, and pheromones; keeps your current
   speed and respawn settings.
+- **Scenarios.** The GUI exposes inspectable bench previews: wall route,
+  arc-to-line, multi-path, food cycle, lost carrier, and cluster escape. Barren
+  setups are hidden; every visible scenario starts with food, walls, and trail
+  context so it can be inspected immediately.
 
 ## What to look for
 

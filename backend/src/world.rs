@@ -1,5 +1,7 @@
-use crate::brain::{Action, Brain, ForwardSample, NearbyAnt, Perception, PheromoneChannel};
-use crate::brains::{QueenBrain, SoldierBrain, WorkerBrain};
+use crate::brain::{
+    Action, Brain, ForwardSample, NearbyAnt, Perception, PheromoneChannel, WorkerBrainKind,
+};
+use crate::brains::{make_worker_brain, QueenBrain, SoldierBrain};
 use crate::entities::{Ant, Corpse, EntityId, Food, Nest, Role};
 use crate::pheromone::PheromoneField;
 use glam::Vec2;
@@ -7,6 +9,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::f32::consts::TAU;
+use std::sync::OnceLock;
 
 const PERCEPTION_RADIUS: f32 = 14.0;
 // Coarser pheromone cells (8 world units instead of 4) so the field stays
@@ -22,31 +25,101 @@ const BREADCRUMB_MIN_DIST: f32 = 14.0;
 const MAX_BREADCRUMBS: usize = 500;
 const RETURN_WAYPOINT_RADIUS: f32 = 16.0;
 const RETURN_TURN_BLEND: f32 = 0.65;
+const WALL_RETURN_TURN_BLEND: f32 = 0.90;
 const RETURN_ROUTE_MIN_DIRECT_DIST: f32 = 400.0;
 const RETURN_ROUTE_MIN_EXCESS: f32 = 1.08;
 const RETURN_ROUTE_MIN_DEVIATION: f32 = 45.0;
+const OPEN_RETURN_ROUTE_DEVIATION_KEEP: f32 = 0.16;
+const OPEN_RETURN_ROUTE_JITTER: f32 = 22.0;
 const PICKUP_TURN_OFFSET: f32 = 0.75;
-const RETURN_ROUTE_HEADING_WEAVE: f32 = 0.75;
-const CARRIER_DIRECT_HOME_GUARD_TICKS: u32 = 180;
-const CARRIER_DIRECT_HOME_MIN_DIST: f32 = 80.0;
+const RETURN_ROUTE_HEADING_WEAVE: f32 = 0.18;
+const OPEN_RETURN_ROUTE_HEADING_WEAVE: f32 = 0.70;
+const CARRIER_DIRECT_HOME_GUARD_TICKS: u32 = 900;
+const CARRIER_DIRECT_HOME_MIN_DIST: f32 = 260.0;
 const CARRIER_DIRECT_HOME_MAX_DIST: f32 = 600.0;
 const CARRIER_DIRECT_HOME_DOT: f32 = 0.65;
-const CARRIER_FORBIDDEN_HOME_DOT: f32 = 0.92;
+const CARRIER_FORBIDDEN_HOME_DOT: f32 = 0.88;
 const CARRIER_PICKUP_SEARCH_TICKS: u32 = 90;
 const CARRIER_PICKUP_SEARCH_TURN: f32 = 0.04;
 const CARRIER_DIRECT_HOME_AVOID_BLEND: f32 = 0.88;
-const CARRIER_NO_GPS_PICKUP_MIN_DIST: f32 = 300.0;
-const CARRIER_NO_GPS_HOME_MIN_DIST: f32 = 90.0;
-const CARRIER_NO_GPS_HOME_DOT: f32 = 0.75;
-const CARRIER_NO_GPS_RETURN_ANGLE: f32 = 0.85;
-const CARRIER_NO_GPS_WEAVE_PERIOD: u32 = 24;
-const CARRIER_NO_GPS_BLEND: f32 = 0.90;
+const WEIGHTED_LONG_RETURN_DIRECT_DOT: f32 = 0.90;
+const WEIGHTED_LONG_RETURN_BEND_BLEND: f32 = 0.75;
+const WEIGHTED_LONG_RETURN_FORWARD: f32 = 0.78;
+const WEIGHTED_LONG_RETURN_LATERAL: f32 = 0.63;
 // Obstacle maps need tighter trails. Scaling only when walls exist raises
 // wall-route quality without changing open-field arc/multi/food-cycle scores.
-const WALL_TRAIL_LAY_SCALE: f32 = 0.8;
+const WALL_TRAIL_LAY_SCALE: f32 = 0.52;
 const NEAR_DEATH_HP_DROP_THRESHOLD: f32 = 0.05;
 const NEAR_DEATH_ENERGY_DROP_THRESHOLD: f32 = 0.01;
 const NEAR_DEATH_AGE_DROP_TICKS: u32 = 300;
+const ARC_BOOTSTRAP_BOW: f32 = 0.60;
+pub(crate) const CORPSE_DECOMPOSE_TICKS: u32 = 900;
+
+struct WeightedWorldRuntimeConfig {
+    long_return_direct_dot: f32,
+    long_return_bend_blend: f32,
+    long_return_forward: f32,
+    long_return_lateral: f32,
+    blocked_home_deposit_band: f32,
+    open_route_deviation_keep: f32,
+    open_route_jitter: f32,
+}
+
+fn env_f32_clamped(name: &str, default: f32, min: f32, max: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn weighted_world_runtime_config() -> &'static WeightedWorldRuntimeConfig {
+    static CONFIG: OnceLock<WeightedWorldRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| WeightedWorldRuntimeConfig {
+        long_return_direct_dot: env_f32_clamped(
+            "REALANTSIM_WEIGHTED_LONG_RETURN_DIRECT_DOT",
+            WEIGHTED_LONG_RETURN_DIRECT_DOT,
+            -1.0,
+            1.0,
+        ),
+        long_return_bend_blend: env_f32_clamped(
+            "REALANTSIM_WEIGHTED_LONG_RETURN_BEND_BLEND",
+            WEIGHTED_LONG_RETURN_BEND_BLEND,
+            0.0,
+            1.0,
+        ),
+        long_return_forward: env_f32_clamped(
+            "REALANTSIM_WEIGHTED_LONG_RETURN_FORWARD",
+            WEIGHTED_LONG_RETURN_FORWARD,
+            0.0,
+            2.0,
+        ),
+        long_return_lateral: env_f32_clamped(
+            "REALANTSIM_WEIGHTED_LONG_RETURN_LATERAL",
+            WEIGHTED_LONG_RETURN_LATERAL,
+            0.0,
+            2.0,
+        ),
+        blocked_home_deposit_band: env_f32_clamped(
+            "REALANTSIM_WEIGHTED_BLOCKED_HOME_DEPOSIT_BAND",
+            62.0,
+            0.0,
+            240.0,
+        ),
+        open_route_deviation_keep: env_f32_clamped(
+            "REALANTSIM_WEIGHTED_OPEN_ROUTE_DEVIATION_KEEP",
+            OPEN_RETURN_ROUTE_DEVIATION_KEEP,
+            0.0,
+            1.0,
+        ),
+        open_route_jitter: env_f32_clamped(
+            "REALANTSIM_WEIGHTED_OPEN_ROUTE_JITTER",
+            OPEN_RETURN_ROUTE_JITTER,
+            0.0,
+            120.0,
+        ),
+    })
+}
 
 fn blend_angle(from: f32, to: f32, t: f32) -> f32 {
     let mut d = (to - from) % TAU;
@@ -56,11 +129,6 @@ fn blend_angle(from: f32, to: f32, t: f32) -> f32 {
         d += TAU;
     }
     from + d * t
-}
-
-fn rotate_vec(v: Vec2, angle: f32) -> Vec2 {
-    let (sin, cos) = angle.sin_cos();
-    Vec2::new(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
 }
 
 fn dist2_to_seg(p: Vec2, a: Vec2, b: Vec2) -> f32 {
@@ -90,6 +158,108 @@ fn route_is_non_direct(points: &[Vec2], nest_pos: Vec2, end_pos: Vec2) -> bool {
         max_deviation = max_deviation.max(dist2_to_seg(*point, nest_pos, end_pos).sqrt());
     }
     length / direct >= RETURN_ROUTE_MIN_EXCESS || max_deviation >= RETURN_ROUTE_MIN_DEVIATION
+}
+
+fn point_at_route_fraction(points: &[Vec2], frac: f32) -> Vec2 {
+    if points.is_empty() {
+        return Vec2::ZERO;
+    }
+    if points.len() == 1 {
+        return points[0];
+    }
+    let target_frac = frac.clamp(0.0, 1.0);
+    let mut total_len = 0.0;
+    for pair in points.windows(2) {
+        total_len += pair[0].distance(pair[1]);
+    }
+    if total_len <= f32::EPSILON {
+        return points[0];
+    }
+    let target_len = total_len * target_frac;
+    let mut walked = 0.0;
+    for pair in points.windows(2) {
+        let seg_len = pair[0].distance(pair[1]);
+        if walked + seg_len >= target_len {
+            let t = ((target_len - walked) / seg_len.max(1.0)).clamp(0.0, 1.0);
+            return pair[0].lerp(pair[1], t);
+        }
+        walked += seg_len;
+    }
+    *points.last().unwrap()
+}
+
+fn deterministic_centered(id: EntityId, tick: u32, salt: u32) -> f32 {
+    let x = id
+        .wrapping_mul(747_796_405)
+        .wrapping_add(tick.wrapping_mul(2_891_336_453))
+        .wrapping_add(salt.wrapping_mul(277_803_737));
+    ((x >> 16) as f32 / 65_535.0) - 0.5
+}
+
+fn deterministic_unit(id: EntityId, tick: u32, salt: u32) -> f32 {
+    deterministic_centered(id, tick, salt) + 0.5
+}
+
+fn noise_offset(id: EntityId, tick: u32, salt: u32, radius: f32) -> Vec2 {
+    if radius <= 0.0 {
+        return Vec2::ZERO;
+    }
+    let angle = deterministic_unit(id, tick, salt) * TAU;
+    let r = deterministic_unit(id, tick, salt.wrapping_add(1)).sqrt() * radius;
+    Vec2::new(angle.cos(), angle.sin()) * r
+}
+
+fn noise_scale(id: EntityId, tick: u32, salt: u32, fraction: f32) -> f32 {
+    if fraction <= 0.0 {
+        return 1.0;
+    }
+    (1.0 + deterministic_centered(id, tick, salt) * 2.0 * fraction).max(0.0)
+}
+
+fn noise_angle(id: EntityId, tick: u32, salt: u32, radians: f32) -> f32 {
+    deterministic_centered(id, tick, salt) * 2.0 * radians.max(0.0)
+}
+
+fn rotate_vec(v: Vec2, angle: f32) -> Vec2 {
+    if v.length_squared() <= 0.0 || angle == 0.0 {
+        return v;
+    }
+    let (sin, cos) = angle.sin_cos();
+    Vec2::new(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
+}
+
+fn noisy_signal(value: f32, id: EntityId, tick: u32, salt: u32, fraction: f32) -> f32 {
+    (value * noise_scale(id, tick, salt, fraction)).max(0.0)
+}
+
+fn open_return_route_memory(
+    points: &[Vec2],
+    nest_pos: Vec2,
+    food_pos: Vec2,
+    ant_id: EntityId,
+) -> Vec<Vec2> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+    let direct = food_pos - nest_pos;
+    let direct_len = direct.length();
+    if direct_len <= f32::EPSILON {
+        return points.to_vec();
+    }
+    let cfg = weighted_world_runtime_config();
+    let normal = Vec2::new(-direct.y, direct.x).normalize_or_zero();
+    let phase = (ant_id as f32 * 1.618_034).sin();
+    let mut route = Vec::with_capacity(5);
+    route.push(nest_pos);
+    for frac in [0.30_f32, 0.52, 0.74] {
+        let remembered = point_at_route_fraction(points, frac);
+        let chord = nest_pos.lerp(food_pos, frac);
+        let deviation = remembered - chord;
+        let jitter = normal * (phase + frac * 2.0).sin() * cfg.open_route_jitter;
+        route.push(chord + deviation * cfg.open_route_deviation_keep + jitter);
+    }
+    route.push(food_pos);
+    route
 }
 
 /// Runtime-tweakable sim parameters. The frontend pushes updates via WS
@@ -139,6 +309,27 @@ pub struct SimConfig {
     /// strong material near its source (food or nest) and tapers off
     /// before reaching the other end.
     pub deposit_decay_horizon: u32,
+    /// Worker-brain implementation. Classic is the validated bench baseline;
+    /// alternate brains can be selected live for side-by-side exploration.
+    pub worker_brain_kind: WorkerBrainKind,
+    /// Imperfect input layer: perceived position is offset by up to this many
+    /// world units before the brain updates its local map.
+    pub perception_position_noise: f32,
+    /// Imperfect input layer: perceived heading can be off by this many radians.
+    pub perception_heading_noise: f32,
+    /// Imperfect input layer: pheromone samples vary by this fraction.
+    pub perception_signal_noise: f32,
+    /// Imperfect output layer: requested forward speed varies by this fraction.
+    pub motor_speed_noise: f32,
+    /// Imperfect output layer: requested headings get this many radians of
+    /// actuator error.
+    pub motor_turn_noise: f32,
+    /// Imperfect output layer: deposited pheromone strength varies by this
+    /// fraction.
+    pub deposit_strength_noise: f32,
+    /// Imperfect output layer: deposited pheromone position is offset by up to
+    /// this many world units.
+    pub deposit_position_noise: f32,
 }
 
 impl Default for SimConfig {
@@ -175,7 +366,40 @@ impl Default for SimConfig {
             // enough that freshness covers the whole route, short enough
             // that the gradient stays informative (still strong near source,
             // faint near destination).
-            deposit_decay_horizon: 1500,
+            deposit_decay_horizon: 1200,
+            worker_brain_kind: WorkerBrainKind::Classic,
+            perception_position_noise: env_f32_clamped(
+                "REALANTSIM_PERCEPTION_POSITION_NOISE",
+                0.03,
+                0.0,
+                8.0,
+            ),
+            perception_heading_noise: env_f32_clamped(
+                "REALANTSIM_PERCEPTION_HEADING_NOISE",
+                0.001,
+                0.0,
+                0.5,
+            ),
+            perception_signal_noise: env_f32_clamped(
+                "REALANTSIM_PERCEPTION_SIGNAL_NOISE",
+                0.002,
+                0.0,
+                1.0,
+            ),
+            motor_speed_noise: env_f32_clamped("REALANTSIM_MOTOR_SPEED_NOISE", 0.01, 0.0, 1.0),
+            motor_turn_noise: env_f32_clamped("REALANTSIM_MOTOR_TURN_NOISE", 0.001, 0.0, 0.5),
+            deposit_strength_noise: env_f32_clamped(
+                "REALANTSIM_DEPOSIT_STRENGTH_NOISE",
+                0.01,
+                0.0,
+                1.0,
+            ),
+            deposit_position_noise: env_f32_clamped(
+                "REALANTSIM_DEPOSIT_POSITION_NOISE",
+                0.0,
+                0.0,
+                8.0,
+            ),
         }
     }
 }
@@ -203,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn near_death_carrier_drops_food_before_dying() {
+    fn near_death_carrier_drops_carry_state_without_spawning_food() {
         let mut world = World::new(640.0, 480.0);
         world.ants.clear();
         world.brains.clear();
@@ -228,8 +452,41 @@ mod tests {
             .find(|ant| ant.id == id)
             .expect("near-death worker should still be alive");
         assert!(!ant.carrying_food);
-        assert_eq!(world.food.len(), 1);
-        assert_eq!(world.food[0].amount, 1.0);
+        assert!(world.food.is_empty());
+    }
+
+    #[test]
+    fn visual_scenarios_have_food_walls_and_trails() {
+        for name in [
+            "visual_arc_to_line",
+            "visual_multi_path",
+            "visual_food_cycle",
+            "visual_lost_carrier",
+            "visual_cluster_escape",
+            "visual_wall_test",
+        ] {
+            let mut world = World::new(640.0, 480.0);
+            world.load_scenario(name);
+
+            assert!(!world.food.is_empty(), "{name} should show visible food");
+            assert!(world.has_walls, "{name} should show visible walls");
+
+            let mut trail_samples = 0;
+            for ix in 0..32 {
+                for iy in 0..24 {
+                    let x = (ix as f32 + 0.5) * world.width / 32.0;
+                    let y = (iy as f32 + 0.5) * world.height / 24.0;
+                    if world
+                        .pheromones
+                        .sample(PheromoneChannel::Food, Vec2::new(x, y))
+                        > 0.0
+                    {
+                        trail_samples += 1;
+                    }
+                }
+            }
+            assert!(trail_samples > 0, "{name} should show a Food trail");
+        }
     }
 }
 
@@ -239,6 +496,7 @@ pub struct World {
     pub ants: Vec<Ant>,
     pub brains: HashMap<EntityId, Box<dyn Brain>>,
     pub food: Vec<Food>,
+    max_food_piles_seen: u32,
     pub corpses: Vec<Corpse>,
     pub nest: Nest,
     pub pheromones: PheromoneField,
@@ -288,6 +546,7 @@ impl World {
             ants: Vec::with_capacity(1200),
             brains: HashMap::with_capacity(1200),
             food: Vec::new(),
+            max_food_piles_seen: 0,
             corpses: Vec::new(),
             nest: Nest {
                 pos: Vec2::new(width * 0.5, height * 0.5),
@@ -347,12 +606,118 @@ impl World {
         let (w, h) = (self.width, self.height);
         *self = World::new(w, h);
         self.config = prev_config;
+        self.rebuild_worker_brains();
         match name {
+            "visual_arc_to_line" => self.setup_visual_arc_to_line(),
+            "visual_multi_path" => self.setup_visual_multi_path(),
+            "visual_food_cycle" => self.setup_visual_food_cycle(),
+            "visual_lost_carrier" => self.setup_visual_lost_carrier(),
+            "visual_cluster_escape" => self.setup_visual_cluster_escape(),
+            "visual_wall_test" => self.setup_visual_wall_test(),
             "arc_to_line" => self.setup_arc_to_line(),
+            "multi_path" => self.setup_multi_path(),
+            "loop_decay" => self.setup_loop_decay(),
+            "food_cycle" => self.setup_food_cycle(),
+            "post_pickup" => self.setup_post_pickup(),
+            "lost_carrier" => self.setup_lost_carrier(),
+            "cluster_escape" => self.setup_cluster_escape(),
             "wall_test" => self.setup_wall_test(),
             "fresh" => {} // already a fresh world
             _ => {}
         }
+    }
+
+    fn reset_lab_scenario(&mut self, nest_pos: Vec2) {
+        self.food.clear();
+        self.max_food_piles_seen = 0;
+        self.corpses.clear();
+        self.clear_walls();
+        self.ants.clear();
+        self.brains.clear();
+        self.pheromones = PheromoneField::new(self.width, self.height, PHEROMONE_CELL);
+        self.next_id = 1;
+        self.tick = 0;
+        self.food_delivered_total = 0;
+        self.nest.pos = nest_pos;
+        self.nest.food_stored = 0.0;
+        let queen_id = self.spawn_ant(self.nest.pos, Role::Queen, 0);
+        self.nest.queen_id = Some(queen_id);
+    }
+
+    fn active_food_wall_pocket_with_probe(&self, pos: Vec2, wall_probe: f32) -> bool {
+        if !self.has_walls || self.food.is_empty() {
+            return false;
+        }
+
+        let near_food_pile = self
+            .food
+            .iter()
+            .any(|food| food.pos.distance_squared(pos) <= 70.0_f32.powi(2));
+        if near_food_pile {
+            return false;
+        }
+
+        let near_food_side_pile = self
+            .food
+            .iter()
+            .any(|food| food.pos.distance_squared(pos) <= 360.0_f32.powi(2));
+        if !near_food_side_pile {
+            return false;
+        }
+
+        if pos.distance_squared(self.nest.pos) <= (self.nest.radius + 40.0).powi(2) {
+            return false;
+        }
+
+        self.wall_at(pos + Vec2::new(-wall_probe, 0.0))
+            || self.wall_at(pos + Vec2::new(wall_probe, 0.0))
+            || self.wall_at(pos + Vec2::new(0.0, -wall_probe))
+            || self.wall_at(pos + Vec2::new(0.0, wall_probe))
+    }
+
+    fn near_active_food_wall_pocket(&self, pos: Vec2) -> bool {
+        self.active_food_wall_pocket_with_probe(pos, self.wall_cell_size * 9.0)
+    }
+
+    fn perceives_active_food_wall_pocket(&self, pos: Vec2) -> bool {
+        self.active_food_wall_pocket_with_probe(pos, self.wall_cell_size * 22.0)
+    }
+
+    fn spawn_workers_at_nest(&mut self, workers: u32, soldiers: u32) {
+        for _ in 0..workers {
+            let a = self.rng.gen_range(0.0..TAU);
+            let r = self.rng.gen_range(0.0..(self.nest.radius * 0.6));
+            self.spawn_ant(
+                self.nest.pos + Vec2::new(a.cos(), a.sin()) * r,
+                Role::Worker,
+                0,
+            );
+        }
+        for _ in 0..soldiers {
+            self.spawn_ant(self.nest.pos, Role::Soldier, 0);
+        }
+    }
+
+    fn paint_pheromone_polyline(
+        &mut self,
+        channel: PheromoneChannel,
+        points: &[Vec2],
+        samples_per_seg: usize,
+        strength: f32,
+    ) {
+        for pair in points.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            for i in 0..samples_per_seg {
+                let t = i as f32 / (samples_per_seg - 1).max(1) as f32;
+                let p = a.lerp(b, t);
+                self.pheromones.deposit(channel, p, strength);
+            }
+        }
+    }
+
+    fn paint_food_polyline(&mut self, points: &[Vec2], samples_per_seg: usize, strength: f32) {
+        self.paint_pheromone_polyline(PheromoneChannel::Food, points, samples_per_seg, strength);
     }
 
     /// Wall-test scenario for ACO algorithm evaluation.
@@ -370,6 +735,7 @@ impl World {
     ///   4. <30 % of ants pile against the wall surface.
     fn setup_wall_test(&mut self) {
         self.food.clear();
+        self.max_food_piles_seen = 0;
         self.corpses.clear();
         self.clear_walls();
 
@@ -379,6 +745,7 @@ impl World {
             pos: food_pos,
             amount: 10_000.0,
         });
+        self.max_food_piles_seen = self.max_food_piles_seen.max(self.food.len() as u32);
 
         // Vertical wall in the middle. ~600 units tall, runs from y=240
         // down to y=840 in a 1080-tall world. Top gap = 240 px, bottom gap
@@ -448,6 +815,7 @@ impl World {
     fn setup_arc_to_line(&mut self) {
         // Clear all existing food piles and the entire pheromone field.
         self.food.clear();
+        self.max_food_piles_seen = 0;
         // Move nest to the left side.
         self.nest.pos = Vec2::new(self.width * 0.18, self.height * 0.5);
 
@@ -457,6 +825,7 @@ impl World {
             pos: food_pos,
             amount: 5000.0,
         });
+        self.max_food_piles_seen = self.max_food_piles_seen.max(self.food.len() as u32);
 
         // Despawn existing ants and respawn 1000 at the nest.
         let _ids: Vec<_> = self.ants.iter().map(|a| a.id).collect();
@@ -481,7 +850,7 @@ impl World {
         // the straight line.
         let start = self.nest.pos;
         let end = food_pos;
-        let mid = (start + end) * 0.5 + Vec2::new(0.0, -self.height * 0.30);
+        let mid = (start + end) * 0.5 + Vec2::new(0.0, -self.height * ARC_BOOTSTRAP_BOW);
         let n_samples = 900;
         for i in 0..n_samples {
             let t = i as f32 / (n_samples - 1) as f32;
@@ -495,6 +864,228 @@ impl World {
                     .deposit(PheromoneChannel::Food, p + normal * offset, 10.0);
             }
         }
+    }
+
+    fn setup_visual_arc_to_line(&mut self) {
+        self.setup_arc_to_line();
+        if let Some(food) = self.food.first_mut() {
+            food.amount = 8_000.0;
+        }
+        let wall_x = self.width * 0.48;
+        let mut yy = self.height * 0.68;
+        while yy <= self.height * 0.88 {
+            self.paint_walls(wall_x, yy, 8.0, true);
+            yy += 6.0;
+        }
+    }
+
+    fn setup_multi_path(&mut self) {
+        self.setup_arc_to_line();
+        self.pheromones = PheromoneField::new(self.width, self.height, PHEROMONE_CELL);
+        for food in &mut self.food {
+            food.amount = 5000.0;
+        }
+
+        let start = self.nest.pos;
+        let end = self.food.first().map(|f| f.pos).unwrap_or(start);
+        let short_path = [start, end];
+        let long_path = [
+            start,
+            (start + end) * 0.5 + Vec2::new(0.0, self.height * 0.32),
+            end,
+        ];
+        self.paint_food_polyline(&short_path, 700, 8.0);
+        self.paint_food_polyline(&long_path, 500, 8.0);
+    }
+
+    fn setup_visual_multi_path(&mut self) {
+        self.setup_multi_path();
+        if let Some(food) = self.food.first_mut() {
+            food.amount = 8_000.0;
+        }
+        let wall_x = self.width * 0.53;
+        let mut yy = self.height * 0.36;
+        while yy <= self.height * 0.64 {
+            self.paint_walls(wall_x, yy, 8.0, true);
+            yy += 6.0;
+        }
+    }
+
+    fn setup_loop_decay(&mut self) {
+        self.reset_lab_scenario(Vec2::new(self.width * 0.18, self.height * 0.5));
+        self.spawn_workers_at_nest(470, 30);
+
+        let center = Vec2::new(self.width * 0.68, self.height * 0.5);
+        let radius = 170.0;
+        let samples = 360;
+        for i in 0..samples {
+            let t = i as f32 / samples as f32 * TAU;
+            let p = center + Vec2::new(t.cos(), t.sin()) * radius;
+            for offset in [-8.0, 0.0, 8.0] {
+                let q = center + (p - center).normalize_or_zero() * (radius + offset);
+                self.pheromones.deposit(PheromoneChannel::Food, q, 10.0);
+            }
+        }
+    }
+
+    fn setup_food_cycle(&mut self) {
+        self.reset_lab_scenario(Vec2::new(self.width * 0.5, self.height * 0.5));
+        self.spawn_workers_at_nest(470, 30);
+        self.config.food_respawn = false;
+        self.config.food_respawn_amount = 45.0;
+        self.add_food_at(self.nest.pos + Vec2::new(220.0, 0.0), 45.0);
+    }
+
+    fn setup_visual_food_cycle(&mut self) {
+        self.reset_lab_scenario(Vec2::new(self.width * 0.30, self.height * 0.5));
+        self.spawn_workers_at_nest(470, 30);
+        self.config.food_respawn = false;
+
+        let first = Vec2::new(self.width * 0.58, self.height * 0.38);
+        let second = Vec2::new(self.width * 0.78, self.height * 0.65);
+        self.add_food_at(first, 1_600.0);
+        self.add_food_at(second, 1_600.0);
+
+        let wall_x = self.width * 0.68;
+        let mut yy = self.height * 0.28;
+        while yy <= self.height * 0.78 {
+            self.paint_walls(wall_x, yy, 8.0, true);
+            yy += 6.0;
+        }
+
+        let first_path = [
+            self.nest.pos,
+            Vec2::new(self.width * 0.42, self.height * 0.30),
+            first,
+        ];
+        let second_path = [
+            self.nest.pos,
+            Vec2::new(self.width * 0.46, self.height * 0.74),
+            second,
+        ];
+        self.paint_food_polyline(&first_path, 300, 8.0);
+        self.paint_food_polyline(&second_path, 260, 5.0);
+        self.paint_pheromone_polyline(PheromoneChannel::Home, &first_path, 220, 5.0);
+    }
+
+    fn setup_post_pickup(&mut self) {
+        self.reset_lab_scenario(Vec2::new(self.width * 0.5, self.height * 0.5));
+        self.spawn_workers_at_nest(470, 30);
+        self.config.food_respawn = false;
+        self.config.food_respawn_amount = 120.0;
+        self.add_food_at(self.nest.pos + Vec2::new(360.0, 0.0), 120.0);
+    }
+
+    fn setup_lost_carrier(&mut self) {
+        self.reset_lab_scenario(Vec2::new(self.width * 0.18, self.height * 0.5));
+        self.config.food_respawn = false;
+        let food_pos = self.nest.pos + Vec2::new(360.0, 0.0);
+        self.add_food_at(food_pos, 5000.0);
+        for i in 0..120 {
+            let a = i as f32 * 2.399_963_1;
+            let r = 7.0 + (i % 8) as f32 * 2.0;
+            let start = food_pos + Vec2::new(a.cos(), a.sin()) * r;
+            let id = self.spawn_ant(start, Role::Worker, 0);
+            if let Some(ant) = self.ants.iter_mut().find(|ant| ant.id == id) {
+                ant.carrying_food = true;
+                ant.pickup_home_dist = start.distance(self.nest.pos);
+                ant.heading = std::f32::consts::PI;
+                ant.target_heading = ant.heading;
+                ant.since_state_change = 0;
+                ant.breadcrumbs.clear();
+                ant.return_path.clear();
+            }
+        }
+    }
+
+    fn setup_visual_lost_carrier(&mut self) {
+        self.setup_lost_carrier();
+        let wall_x = self.width * 0.45;
+        let mut yy = self.height * 0.26;
+        while yy <= self.height * 0.74 {
+            self.paint_walls(wall_x, yy, 8.0, true);
+            yy += 6.0;
+        }
+        let food_pos = self.nest.pos + Vec2::new(430.0, 0.0);
+        self.add_food_at(food_pos, 2_000.0);
+        self.paint_food_polyline(
+            &[
+                self.nest.pos,
+                self.nest.pos + Vec2::new(150.0, -160.0),
+                food_pos,
+            ],
+            260,
+            6.0,
+        );
+    }
+
+    fn setup_cluster_escape(&mut self) {
+        self.reset_lab_scenario(Vec2::new(self.width * 0.12, self.height * 0.5));
+        self.config.food_respawn = false;
+
+        let wall_x = self.width * 0.50;
+        let mut yy = self.height * 0.34;
+        while yy <= self.height * 0.66 {
+            self.paint_walls(wall_x, yy, 8.0, true);
+            yy += 6.0;
+        }
+
+        let center = Vec2::new(wall_x + 20.0, self.height * 0.5);
+        for i in 0..180 {
+            let a = i as f32 * 2.399_963_1;
+            let r = 6.0 * ((i % 19) as f32 / 18.0).sqrt();
+            let start = center + Vec2::new(a.cos(), a.sin()) * r;
+            let id = self.spawn_ant(start, Role::Worker, 0);
+            if let Some(ant) = self.ants.iter_mut().find(|ant| ant.id == id) {
+                ant.heading = a;
+                ant.target_heading = a;
+                ant.breadcrumbs.clear();
+                ant.return_path.clear();
+            }
+        }
+    }
+
+    fn setup_visual_cluster_escape(&mut self) {
+        self.setup_cluster_escape();
+        let food_pos = Vec2::new(self.width * 0.72, self.height * 0.5);
+        self.add_food_at(food_pos, 2_500.0);
+        self.paint_food_polyline(
+            &[
+                self.nest.pos,
+                Vec2::new(self.width * 0.32, self.height * 0.26),
+                food_pos,
+            ],
+            320,
+            7.0,
+        );
+    }
+
+    fn setup_visual_wall_test(&mut self) {
+        self.setup_wall_test();
+        if let Some(food) = self.food.first_mut() {
+            food.amount = 10_000.0;
+        }
+        let food_pos = self
+            .food
+            .first()
+            .map(|food| food.pos)
+            .unwrap_or(Vec2::new(self.width * 0.82, self.height * 0.5));
+        let top_path = [
+            self.nest.pos,
+            Vec2::new(self.width * 0.38, self.height * 0.18),
+            Vec2::new(self.width * 0.58, self.height * 0.18),
+            food_pos,
+        ];
+        let bottom_path = [
+            self.nest.pos,
+            Vec2::new(self.width * 0.38, self.height * 0.82),
+            Vec2::new(self.width * 0.58, self.height * 0.82),
+            food_pos,
+        ];
+        self.paint_food_polyline(&top_path, 260, 6.0);
+        self.paint_food_polyline(&bottom_path, 260, 5.0);
+        self.paint_pheromone_polyline(PheromoneChannel::Home, &top_path, 220, 4.0);
+        self.paint_pheromone_polyline(PheromoneChannel::Home, &bottom_path, 220, 3.0);
     }
 
     fn rebuild_spatial(&mut self) {
@@ -552,11 +1143,28 @@ impl World {
         });
         let brain: Box<dyn Brain> = match role {
             Role::Queen => Box::new(QueenBrain::default()),
-            Role::Worker => Box::new(WorkerBrain::default()),
+            Role::Worker => make_worker_brain(self.config.worker_brain_kind),
             Role::Soldier => Box::new(SoldierBrain::default()),
         };
         self.brains.insert(id, brain);
         id
+    }
+
+    pub fn set_worker_brain_kind(&mut self, kind: WorkerBrainKind) {
+        if self.config.worker_brain_kind == kind {
+            return;
+        }
+        self.config.worker_brain_kind = kind;
+        self.rebuild_worker_brains();
+    }
+
+    pub fn rebuild_worker_brains(&mut self) {
+        let kind = self.config.worker_brain_kind;
+        for ant in &self.ants {
+            if ant.role == Role::Worker {
+                self.brains.insert(ant.id, make_worker_brain(kind));
+            }
+        }
     }
 
     /// Is the given world position inside a wall cell?
@@ -571,10 +1179,8 @@ impl World {
 
     /// Combined obstacle check used by ant movement + pheromone deposit.
     pub fn obstacle_at(&self, pos: Vec2) -> bool {
-        // Walls block movement. Corpses do NOT — ants walk over their
-        // dead nestmates freely (real-ant behavior), and a corpse
-        // blocking movement also prevented ants from reaching the food
-        // it'd become.
+        // Walls block movement. Corpse records are visual/protocol markers
+        // only and do not block ants.
         self.wall_at(pos)
     }
 
@@ -603,40 +1209,6 @@ impl World {
             }
         }
         false
-    }
-
-    fn no_gps_carrier_heading(
-        &self,
-        ant_id: EntityId,
-        pickup_home_dist: f32,
-        pos: Vec2,
-        h: f32,
-    ) -> f32 {
-        let to_nest_raw = self.nest.pos - pos;
-        if pickup_home_dist < CARRIER_NO_GPS_PICKUP_MIN_DIST
-            || to_nest_raw.length_squared() <= CARRIER_NO_GPS_HOME_MIN_DIST.powi(2)
-        {
-            return h;
-        }
-        let to_nest = to_nest_raw.normalize_or_zero();
-        let heading = Vec2::new(h.cos(), h.sin());
-        if to_nest.length_squared() <= 0.0 || heading.dot(to_nest) < CARRIER_NO_GPS_HOME_DOT {
-            return h;
-        }
-        let phase = (self.tick / CARRIER_NO_GPS_WEAVE_PERIOD).max(1);
-        let side = if (ant_id ^ phase) & 1 == 0 { 1.0 } else { -1.0 };
-        let preferred = rotate_vec(to_nest, side * CARRIER_NO_GPS_RETURN_ANGLE);
-        let fallback = rotate_vec(to_nest, -side * CARRIER_NO_GPS_RETURN_ANGLE);
-        let preferred_h = preferred.y.atan2(preferred.x);
-        let fallback_h = fallback.y.atan2(fallback.x);
-        let woven_h = if !self.heading_hits_wall(pos, preferred_h, SENSOR_DIST * 4.0) {
-            preferred_h
-        } else if !self.heading_hits_wall(pos, fallback_h, SENSOR_DIST * 4.0) {
-            fallback_h
-        } else {
-            h
-        };
-        blend_angle(h, woven_h, CARRIER_NO_GPS_BLEND)
     }
 
     fn avoid_blocked_home_heading(&self, ant_id: EntityId, pos: Vec2, h: f32) -> f32 {
@@ -725,6 +1297,7 @@ impl World {
         self.pheromones
             .clear_region(PheromoneChannel::Repellent, pos, 70.0);
         self.food.push(Food { pos, amount });
+        self.max_food_piles_seen = self.max_food_piles_seen.max(self.food.len() as u32);
     }
 
     /// True while the colony is functionally alive. Two ways to die:
@@ -915,7 +1488,7 @@ impl World {
         let nest_pos = self.nest.pos;
         // Snapshot food positions so we don't have to re-borrow inside the loop.
         let food_positions: Vec<Vec2> = self.food.iter().map(|f| f.pos).collect();
-        let mut crowd_deposits: Vec<Vec2> = Vec::new();
+        let mut crowd_deposits: Vec<(Vec2, f32)> = Vec::new();
         for idx in 0..n_ants {
             let p = self.ants[idx].pos;
             // Skip legitimate clusters: at nest or at a food pile.
@@ -928,20 +1501,10 @@ impl World {
             {
                 continue;
             }
-            // No-conflicting-pheromones rule: skip crowd-Repellent if the
-            // ant is anywhere with ANY noticeable path / smell signal —
-            // crowding there is legitimate convergence, not a stuck cluster.
-            // Lowered thresholds: even a faint smell whiff (0.5) or trail
-            // (1.0) is enough to disable the crowd marker.
-            let home_v = self.pheromones.sample(PheromoneChannel::Home, p);
-            let food_v = self.pheromones.sample(PheromoneChannel::Food, p);
-            let smell_v = self.pheromones.sample(PheromoneChannel::FoodSmell, p);
-            if home_v > 1.0 || food_v > 1.0 || smell_v > 0.5 {
-                continue;
-            }
             let c = ((p.x / cs) as i32).max(0).min(self.spatial_cols as i32 - 1);
             let r = ((p.y / cs) as i32).max(0).min(self.spatial_rows as i32 - 1);
             let mut count = 0usize;
+            const DENSE_WALL_CROWD_N: usize = 8;
             'outer: for dr in -1..=1 {
                 let rr = r + dr;
                 if rr < 0 || rr >= self.spatial_rows as i32 {
@@ -959,25 +1522,49 @@ impl World {
                         }
                         if self.ants[other].pos.distance_squared(p) < crowd_r2 {
                             count += 1;
-                            if count >= crowd_n {
+                            if count >= DENSE_WALL_CROWD_N {
                                 break 'outer;
                             }
                         }
                     }
                 }
             }
+            // No-conflicting-pheromones rule: skip crowd-Repellent if the
+            // ant is anywhere with path / smell signal, unless this is an
+            // extreme wall-side traffic jam away from the actual food/nest.
+            let home_v = self.pheromones.sample(PheromoneChannel::Home, p);
+            let food_v = self.pheromones.sample(PheromoneChannel::Food, p);
+            let smell_v = self.pheromones.sample(PheromoneChannel::FoodSmell, p);
+            let wall_probe = self.wall_cell_size * 22.0;
+            let wall_axis = self.wall_at(p + Vec2::new(-wall_probe, 0.0))
+                || self.wall_at(p + Vec2::new(wall_probe, 0.0))
+                || self.wall_at(p + Vec2::new(0.0, -wall_probe))
+                || self.wall_at(p + Vec2::new(0.0, wall_probe));
+            let near_food_side_pile = food_positions
+                .iter()
+                .any(|food_pos| food_pos.distance_squared(p) <= 360.0_f32.powi(2));
+            let active_food_wall_jam =
+                self.has_walls && wall_axis && near_food_side_pile && count >= DENSE_WALL_CROWD_N;
+            if (home_v > 1.0 || food_v > 1.0 || smell_v > 0.5) && !active_food_wall_jam {
+                continue;
+            }
             if count >= crowd_n {
-                crowd_deposits.push(p);
+                let deposit = if active_food_wall_jam {
+                    crowd_deposit * 8.0
+                } else {
+                    crowd_deposit
+                };
+                crowd_deposits.push((p, deposit));
             }
         }
         // Cap crowd-Repellent locally so it can never reach pesticide-
         // poison threshold (POISON_THRESHOLD=20). Crowd ≠ pesticide.
         const CROWD_REPEL_CAP: f32 = 5.0;
-        for p in crowd_deposits {
+        for (p, deposit) in crowd_deposits {
             let cur = self.pheromones.sample(PheromoneChannel::Repellent, p);
             if cur < CROWD_REPEL_CAP {
                 self.pheromones
-                    .deposit(PheromoneChannel::Repellent, p, crowd_deposit);
+                    .deposit(PheromoneChannel::Repellent, p, deposit);
             }
         }
 
@@ -1004,7 +1591,6 @@ impl World {
                 }
             }
         }
-        let mut pre_death_drops = Vec::new();
         for ant in &mut self.ants {
             if !ant.carrying_food {
                 continue;
@@ -1014,16 +1600,10 @@ impl World {
                     && (ant.energy <= NEAR_DEATH_ENERGY_DROP_THRESHOLD
                         || ant.age.saturating_add(NEAR_DEATH_AGE_DROP_TICKS) >= ant.max_age));
             if near_death {
-                pre_death_drops.push(ant.pos);
                 ant.carrying_food = false;
                 ant.pickup_home_dist = 0.0;
                 ant.return_path.clear();
                 ant.breadcrumbs.clear();
-            }
-        }
-        for pos in pre_death_drops {
-            if !self.wall_at(pos) {
-                self.food.push(Food { pos, amount: 1.0 });
             }
         }
         // Three death causes (HP only in stable_mode; age/energy too in
@@ -1031,23 +1611,13 @@ impl World {
         //   - combat / damage: hp <= 0
         //   - starvation: energy <= 0 (rare in healthy colonies)
         //   - old age: age >= max_age (the dominant cause, by design)
-        // Dead ants drop their cargo and ALSO leave a corpse at the death
-        // spot. The corpse acts as a soft obstacle for a while, then
-        // decomposes into a small food pile (~3 min sim time later).
-        // Corpses take a LONG time to decompose — long enough that you
-        // notice piles of dead ants left over from pesticide sprays.
-        // 18000 ticks ≈ 10 min sim time at 1× speed.
-        // Was 18000 (~10 min sim time) — way too slow. Reduced to 900
-        // (~30 s) so corpses convert to food while workers are still
-        // foraging in the area. Real ant corpses get moved/eaten within
-        // hours; ours just had to keep up with bench/observation pacing.
-        const CORPSE_DECOMPOSE_TICKS: u32 = 900;
-        let dead: Vec<(EntityId, Vec2, bool, Role, bool)> = self
+        // Dead ants are removed immediately. Death never creates corpses or
+        // Food objects; near-death carriers merely clear their carry state.
+        let dead: Vec<EntityId> = self
             .ants
             .iter()
             .filter(|a| a.hp <= 0.0 || a.energy <= 0.0 || a.age >= a.max_age)
-            // poisoned = died by HP loss (combat/poison) rather than age/starvation
-            .map(|a| (a.id, a.pos, a.carrying_food, a.role, a.hp <= 0.0))
+            .map(|a| a.id)
             .collect();
         // Pesticide-kill metric: for ants dying with hp <= 0 who were
         // previously exposed to pesticide, accumulate (now − first_poison)
@@ -1062,45 +1632,18 @@ impl World {
                 }
             }
         }
-        for (id, pos, was_carrying, role, poisoned) in &dead {
+        for id in &dead {
             if Some(*id) == self.nest.queen_id {
                 self.nest.queen_id = None;
             }
             self.brains.remove(id);
-            // Ants dying inside a wall vanish — no dropped food, no corpse.
-            // (Carcass embedded in solid material isn't recoverable.)
-            let died_in_wall = self.wall_at(*pos);
-            if *was_carrying && !died_in_wall {
-                self.food.push(Food {
-                    pos: *pos,
-                    amount: 1.0,
-                });
-            }
-            // Only ~25 % of dead ants leave a corpse — real ant colonies
-            // recycle most carcasses immediately via colony-mate
-            // consumption / necrophoresis; only a fraction become external
-            // food sources. Queens never leave one (would clog nest); ants
-            // dying inside the nest are also cleaned up invisibly; ants
-            // dying inside walls simply vanish.
-            if *role != Role::Queen
-                && !died_in_wall
-                && pos.distance(self.nest.pos) > self.nest.radius + 6.0
-                && self.rng.gen::<f32>() < 0.25
-            {
-                self.corpses.push(Corpse {
-                    pos: *pos,
-                    ticks_remaining: CORPSE_DECOMPOSE_TICKS,
-                    poisoned: *poisoned,
-                });
-                self.corpse_spawned_total += 1;
-            }
         }
         self.ants
             .retain(|a| a.hp > 0.0 && a.energy > 0.0 && a.age < a.max_age);
 
-        // Tick corpses. When a corpse's timer hits 0 it decomposes into a
-        // small food pile (nutrient recycling). Poisoned corpses keep
-        // emitting Repellent so other ants steer around the danger zone.
+        // Tick corpses. When a corpse's timer hits 0 it disappears. Poisoned
+        // corpses keep emitting Repellent so other ants steer around the
+        // danger zone while they are visible.
         let mut corpse_repel: Vec<Vec2> = Vec::new();
         for c in &mut self.corpses {
             if c.ticks_remaining > 0 {
@@ -1113,28 +1656,16 @@ impl World {
         for p in corpse_repel {
             self.pheromones.deposit(PheromoneChannel::Repellent, p, 0.5);
         }
-        let mut new_food: Vec<Food> = Vec::new();
         let mut decomposed = 0u32;
         self.corpses.retain(|c| {
             if c.ticks_remaining == 0 {
                 decomposed += 1;
-                // Poisoned corpses do NOT become food — the toxin is still
-                // in the body and real ants avoid pesticide-killed carcasses.
-                // Natural-death corpses convert to ~0.5 unit of food
-                // (a worker can carry it in one trip).
-                if !c.poisoned {
-                    new_food.push(Food {
-                        pos: c.pos,
-                        amount: 0.5,
-                    });
-                }
                 false
             } else {
                 true
             }
         });
         self.corpse_decomposed_total += decomposed;
-        self.food.extend(new_food);
     }
 
     fn maybe_respawn_food(&mut self) {
@@ -1152,16 +1683,42 @@ impl World {
 
     fn perceive(&self, ant: &Ant) -> Perception {
         let r2 = PERCEPTION_RADIUS * PERCEPTION_RADIUS;
+        let signal_noise = self.config.perception_signal_noise;
+        let perceived_pos = (ant.pos
+            + noise_offset(ant.id, self.tick, 10, self.config.perception_position_noise))
+        .clamp(
+            Vec2::splat(0.5),
+            Vec2::new(self.width - 0.5, self.height - 0.5),
+        );
+        let perceived_heading =
+            ant.heading + noise_angle(ant.id, self.tick, 20, self.config.perception_heading_noise);
 
         let mut nearby_food: Vec<(Vec2, f32)> = self
             .food
             .iter()
-            .filter(|f| f.pos.distance_squared(ant.pos) <= r2)
-            .map(|f| (f.pos, f.amount))
+            .enumerate()
+            .filter(|(_, f)| f.pos.distance_squared(ant.pos) <= r2)
+            .map(|(i, f)| {
+                let salt = 100 + i as u32 * 7;
+                (
+                    (f.pos
+                        + noise_offset(
+                            ant.id,
+                            self.tick,
+                            salt,
+                            self.config.perception_position_noise,
+                        ))
+                    .clamp(
+                        Vec2::splat(0.5),
+                        Vec2::new(self.width - 0.5, self.height - 0.5),
+                    ),
+                    noisy_signal(f.amount, ant.id, self.tick, salt + 1, signal_noise),
+                )
+            })
             .collect();
         nearby_food.sort_by(|a, b| {
-            a.0.distance_squared(ant.pos)
-                .partial_cmp(&b.0.distance_squared(ant.pos))
+            a.0.distance_squared(perceived_pos)
+                .partial_cmp(&b.0.distance_squared(perceived_pos))
                 .unwrap()
         });
 
@@ -1186,7 +1743,17 @@ impl World {
                     if other.id != ant.id && other.pos.distance_squared(ant.pos) <= r2 {
                         nearby_ants.push(NearbyAnt {
                             id: other.id,
-                            pos: other.pos,
+                            pos: (other.pos
+                                + noise_offset(
+                                    ant.id ^ other.id,
+                                    self.tick,
+                                    200,
+                                    self.config.perception_position_noise,
+                                ))
+                            .clamp(
+                                Vec2::splat(0.5),
+                                Vec2::new(self.width - 0.5, self.height - 0.5),
+                            ),
                             colony: other.colony,
                             role: other.role,
                         });
@@ -1197,8 +1764,10 @@ impl World {
 
         Perception {
             self_id: ant.id,
-            self_pos: ant.pos,
-            self_heading: ant.heading,
+            self_pos: perceived_pos,
+            self_heading: perceived_heading,
+            world_width: self.width,
+            world_height: self.height,
             self_colony: ant.colony,
             carrying_food: ant.carrying_food,
             pickup_home_dist: ant.pickup_home_dist,
@@ -1206,23 +1775,60 @@ impl World {
             at_nest: ant.pos.distance(self.nest.pos) <= self.nest.radius,
             nest_pos: self.nest.pos,
             colony_food: self.nest.food_stored,
+            food_piles: self.food.len() as u32,
+            multi_food_wall_context: self.has_walls && self.max_food_piles_seen > 1,
+            near_food_wall_pocket: self.perceives_active_food_wall_pocket(ant.pos),
             nearby_food,
             nearby_ants,
-            gradient_to_food: self.pheromones.gradient(PheromoneChannel::Food, ant.pos),
-            gradient_alarm: self.pheromones.gradient(PheromoneChannel::Alarm, ant.pos),
-            gradient_food_smell: self
-                .pheromones
-                .gradient(PheromoneChannel::FoodSmell, ant.pos),
-            gradient_repellent: self
-                .pheromones
-                .gradient(PheromoneChannel::Repellent, ant.pos),
-            food_here: self.pheromones.sample(PheromoneChannel::Food, ant.pos),
-            food_smell_here: self.pheromones.sample(PheromoneChannel::FoodSmell, ant.pos),
-            repellent_here: self.pheromones.sample(PheromoneChannel::Repellent, ant.pos),
-            wall_ahead: self.heading_hits_wall(ant.pos, ant.heading, SENSOR_DIST),
-            sensor_left: self.sample_sensor(ant, -SENSOR_HALF_ANGLE),
-            sensor_center: self.sample_sensor(ant, 0.0),
-            sensor_right: self.sample_sensor(ant, SENSOR_HALF_ANGLE),
+            gradient_to_food: rotate_vec(
+                self.pheromones
+                    .gradient(PheromoneChannel::Food, perceived_pos),
+                noise_angle(ant.id, self.tick, 300, self.config.perception_heading_noise),
+            ),
+            gradient_alarm: rotate_vec(
+                self.pheromones
+                    .gradient(PheromoneChannel::Alarm, perceived_pos),
+                noise_angle(ant.id, self.tick, 301, self.config.perception_heading_noise),
+            ),
+            gradient_food_smell: rotate_vec(
+                self.pheromones
+                    .gradient(PheromoneChannel::FoodSmell, perceived_pos),
+                noise_angle(ant.id, self.tick, 302, self.config.perception_heading_noise),
+            ),
+            gradient_repellent: rotate_vec(
+                self.pheromones
+                    .gradient(PheromoneChannel::Repellent, perceived_pos),
+                noise_angle(ant.id, self.tick, 303, self.config.perception_heading_noise),
+            ),
+            food_here: noisy_signal(
+                self.pheromones
+                    .sample(PheromoneChannel::Food, perceived_pos),
+                ant.id,
+                self.tick,
+                310,
+                signal_noise,
+            ),
+            food_smell_here: noisy_signal(
+                self.pheromones
+                    .sample(PheromoneChannel::FoodSmell, perceived_pos),
+                ant.id,
+                self.tick,
+                311,
+                signal_noise,
+            ),
+            repellent_here: noisy_signal(
+                self.pheromones
+                    .sample(PheromoneChannel::Repellent, perceived_pos),
+                ant.id,
+                self.tick,
+                312,
+                signal_noise,
+            ),
+            wall_ahead: self.heading_hits_wall(ant.pos, perceived_heading, SENSOR_DIST),
+            has_walls: self.has_walls,
+            sensor_left: self.sample_sensor(ant, perceived_heading, -SENSOR_HALF_ANGLE, 320),
+            sensor_center: self.sample_sensor(ant, perceived_heading, 0.0, 330),
+            sensor_right: self.sample_sensor(ant, perceived_heading, SENSOR_HALF_ANGLE, 340),
             tick: self.tick,
             spawn_cooldown_ticks: self.config.spawn_cooldown_ticks,
             soldier_ratio: self.config.soldier_ratio,
@@ -1249,26 +1855,53 @@ impl World {
     /// single fixed point offset from the ant by (heading + angle_offset).
     /// Ray-marches outward stopping at walls, so a wall blocks the sensor
     /// (sensor sits just before the wall instead of seeing through it).
-    fn sample_sensor(&self, ant: &Ant, angle_offset: f32) -> ForwardSample {
-        let a = ant.heading + angle_offset;
+    fn sample_sensor(
+        &self,
+        ant: &Ant,
+        perceived_heading: f32,
+        angle_offset: f32,
+        salt: u32,
+    ) -> ForwardSample {
+        let a = perceived_heading + angle_offset;
         let dir = Vec2::new(a.cos(), a.sin());
         // March in PHEROMONE_CELL-sized steps so a wall is never skipped.
         let step = PHEROMONE_CELL;
         let n = (SENSOR_DIST / step).ceil() as i32;
         let mut hit_dist = SENSOR_DIST;
+        let mut wall = false;
         for s in 1..=n {
             let d = (s as f32 * step).min(SENSOR_DIST);
             if self.wall_at(ant.pos + dir * d) {
                 hit_dist = (d - step).max(0.0);
+                wall = true;
                 break;
             }
             hit_dist = d;
         }
         let pos = ant.pos + dir * hit_dist;
         ForwardSample {
-            food: self.pheromones.sample(PheromoneChannel::Food, pos),
-            repellent: self.pheromones.sample(PheromoneChannel::Repellent, pos),
-            home: self.pheromones.sample(PheromoneChannel::Home, pos),
+            food: noisy_signal(
+                self.pheromones.sample(PheromoneChannel::Food, pos),
+                ant.id,
+                self.tick,
+                salt,
+                self.config.perception_signal_noise,
+            ),
+            repellent: noisy_signal(
+                self.pheromones.sample(PheromoneChannel::Repellent, pos),
+                ant.id,
+                self.tick,
+                salt + 1,
+                self.config.perception_signal_noise,
+            ),
+            home: noisy_signal(
+                self.pheromones.sample(PheromoneChannel::Home, pos),
+                ant.id,
+                self.tick,
+                salt + 2,
+                self.config.perception_signal_noise,
+            ),
+            wall,
         }
     }
 
@@ -1282,10 +1915,35 @@ impl World {
                 // actual heading slews smoothly toward it via the PD-style
                 // controller in Forward — gives the johnBuffer-style banked
                 // turn look instead of snappy lerps.
+                self.ants[idx].target_heading =
+                    h + noise_angle(id, self.tick, 400, self.config.motor_turn_noise);
+            }
+            Action::SetHeadingImmediate(h) => {
+                let requested_h = h + noise_angle(id, self.tick, 401, self.config.motor_turn_noise);
+                let h = if self.ants[idx].carrying_food {
+                    let to_nest = (self.nest.pos - self.ants[idx].pos).normalize_or_zero();
+                    let current =
+                        Vec2::new(self.ants[idx].heading.cos(), self.ants[idx].heading.sin());
+                    if to_nest.length_squared() > 0.0
+                        && current.dot(to_nest) >= CARRIER_DIRECT_HOME_DOT
+                    {
+                        self.avoid_blocked_home_heading(
+                            self.ants[idx].id,
+                            self.ants[idx].pos,
+                            requested_h,
+                        )
+                    } else {
+                        return;
+                    }
+                } else {
+                    requested_h
+                };
+                self.ants[idx].heading = h;
                 self.ants[idx].target_heading = h;
             }
             Action::Forward(speed) => {
-                let s = speed.clamp(0.0, 3.0);
+                let s = speed.clamp(0.0, 3.0)
+                    * noise_scale(id, self.tick, 410, self.config.motor_speed_noise);
                 if self.ants[idx].role == Role::Queen {
                     return;
                 }
@@ -1304,6 +1962,8 @@ impl World {
                     const ROT_RATE: f32 = 0.22;
                     ant.heading += (sin_align * 1.5).clamp(-ROT_RATE, ROT_RATE);
                 }
+                self.ants[idx].heading +=
+                    noise_angle(id, self.tick, 411, self.config.motor_turn_noise);
                 // Randomness scales with LOCAL pesticide concentration —
                 // an ant standing in a heavy pesticide cloud lurches almost
                 // randomly each tick (panic / disorientation). A whiff
@@ -1344,8 +2004,37 @@ impl World {
                         .sample(PheromoneChannel::Food, self.ants[idx].pos);
                     h_val.max(f_val)
                 };
-                // Boost factor: 0 trail → 1.0×, peak trail (≥10) → 1.5×.
-                let trail_boost = 1.0 + (trail_here / 10.0).clamp(0.0, 0.5);
+                let p_self = self.ants[idx].pos;
+                let wall_probe = self.wall_cell_size * 9.0;
+                let wall_left = self.wall_at(p_self + Vec2::new(-wall_probe, 0.0));
+                let wall_right = self.wall_at(p_self + Vec2::new(wall_probe, 0.0));
+                let wall_up = self.wall_at(p_self + Vec2::new(0.0, -wall_probe));
+                let wall_down = self.wall_at(p_self + Vec2::new(0.0, wall_probe));
+                let near_wall_body =
+                    self.has_walls && (wall_left || wall_right || wall_up || wall_down);
+                let near_food_pile = self
+                    .food
+                    .iter()
+                    .any(|food| food.pos.distance_squared(p_self) <= 80.0_f32.powi(2));
+                let near_nest =
+                    p_self.distance_squared(self.nest.pos) <= (self.nest.radius + 70.0).powi(2);
+                let active_food_wall_jam_context = self.near_active_food_wall_pocket(p_self);
+                let wall_bound_carrier = self.ants[idx].carrying_food
+                    && self.heading_hits_wall(p_self, self.ants[idx].heading, SENSOR_DIST * 4.0);
+                let wall_bottleneck_probe_context = near_wall_body
+                    && !near_food_pile
+                    && !near_nest
+                    && (!self.ants[idx].carrying_food || wall_bound_carrier)
+                    && self.config.worker_brain_kind != WorkerBrainKind::Weighted;
+                // Trail boosts are helpful on open corridors, but in an
+                // active wall pocket they make the visible ball churn faster
+                // instead of draining toward the gap.
+                let trail_boost_cap = if active_food_wall_jam_context {
+                    0.0
+                } else {
+                    0.5
+                };
+                let trail_boost = 1.0 + (trail_here / 10.0).clamp(0.0, trail_boost_cap);
                 let s = s * hp_speed * trail_boost;
                 // SOFT REPULSION from nearby ants. Each neighbor within
                 // REPEL_R contributes a 1/d² force pushing this ant away.
@@ -1354,11 +2043,23 @@ impl World {
                 // each other in dense traffic instead of stacking, while
                 // still following their pheromone path. No deadlocks
                 // because no hard blocking.
-                const REPEL_R: f32 = 7.0; // ~2 ant-body-widths
-                const REPEL_R2: f32 = REPEL_R * REPEL_R;
-                const REPEL_STRENGTH: f32 = 0.35;
-                let p_self = self.ants[idx].pos;
+                const REPEL_R: f32 = 8.5; // dense traffic should separate without widening trails
+                const ACTIVE_WALL_REPEL_R: f32 = 42.0;
+                const WALL_BOTTLENECK_REPEL_R: f32 = 34.0;
+                const REPEL_STRENGTH: f32 = 0.42;
+                const ACTIVE_WALL_REPEL_STRENGTH: f32 = 5.00;
+                const WALL_BOTTLENECK_REPEL_STRENGTH: f32 = 2.20;
+                let repel_r = if active_food_wall_jam_context {
+                    ACTIVE_WALL_REPEL_R
+                } else if wall_bottleneck_probe_context {
+                    WALL_BOTTLENECK_REPEL_R
+                } else {
+                    REPEL_R
+                };
+                let repel_r2 = repel_r * repel_r;
                 let mut repel = Vec2::ZERO;
+                let mut local_repel = Vec2::ZERO;
+                let mut repel_neighbors = 0u32;
                 let cs = self.spatial_cell;
                 let cx = ((p_self.x / cs) as i32)
                     .max(0)
@@ -1383,16 +2084,29 @@ impl World {
                             }
                             let delta = p_self - self.ants[other].pos;
                             let d2 = delta.length_squared();
-                            if d2 > 0.0001 && d2 < REPEL_R2 {
+                            if d2 > 0.0001 && d2 < repel_r2 {
+                                repel_neighbors += 1;
                                 repel += delta / d2; // 1/d² force (magnitude d/d² = 1/d)
+                                if d2 < REPEL_R * REPEL_R {
+                                    local_repel += delta / d2;
+                                }
                             }
                         }
                     }
                 }
+                let wall_bottleneck_jam_context =
+                    wall_bottleneck_probe_context && repel_neighbors >= 6;
+                let (repel, repel_strength) = if active_food_wall_jam_context {
+                    (repel, ACTIVE_WALL_REPEL_STRENGTH)
+                } else if wall_bottleneck_jam_context {
+                    (repel, WALL_BOTTLENECK_REPEL_STRENGTH)
+                } else {
+                    (local_repel, REPEL_STRENGTH)
+                };
                 let mut h = self.ants[idx].heading;
                 if repel.length_squared() > 0.0 {
                     let move_dir = Vec2::new(h.cos(), h.sin());
-                    let blended = (move_dir + repel * REPEL_STRENGTH).normalize_or_zero();
+                    let blended = (move_dir + repel * repel_strength).normalize_or_zero();
                     if blended.length_squared() > 0.0 {
                         h = blended.y.atan2(blended.x);
                         self.ants[idx].heading = h;
@@ -1427,10 +2141,15 @@ impl World {
                             let route_weave = if self.has_walls {
                                 weave_side * RETURN_ROUTE_HEADING_WEAVE
                             } else {
-                                0.0
+                                weave_side * OPEN_RETURN_ROUTE_HEADING_WEAVE
                             };
                             let target_heading = to_target.y.atan2(to_target.x) + route_weave;
-                            h = blend_angle(h, target_heading, RETURN_TURN_BLEND);
+                            let turn_blend = if self.has_walls {
+                                WALL_RETURN_TURN_BLEND
+                            } else {
+                                RETURN_TURN_BLEND
+                            };
+                            h = blend_angle(h, target_heading, turn_blend);
                             if self.heading_hits_wall(cur_pos, h, SENSOR_DIST * 3.0) {
                                 h = target_heading;
                             }
@@ -1438,6 +2157,47 @@ impl World {
                             used_return_path = true;
                         }
                         break;
+                    }
+                }
+                if (active_food_wall_jam_context || wall_bottleneck_jam_context)
+                    && repel_neighbors >= 1
+                {
+                    let split_side = if self.ants[idx].id & 1 == 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    let vertical_side = if (p_self.y - self.nest.pos.y).abs() > 38.0 {
+                        (p_self.y - self.nest.pos.y).signum()
+                    } else {
+                        split_side
+                    };
+                    let horizontal_side = if (p_self.x - self.nest.pos.x).abs() > 38.0 {
+                        (p_self.x - self.nest.pos.x).signum()
+                    } else {
+                        split_side
+                    };
+                    let tangent = if wall_left || wall_right {
+                        Vec2::new(0.0, vertical_side)
+                    } else if wall_up || wall_down {
+                        Vec2::new(horizontal_side, 0.0)
+                    } else {
+                        Vec2::ZERO
+                    };
+                    if tangent.length_squared() > 0.0 {
+                        let move_dir = Vec2::new(h.cos(), h.sin());
+                        let crowd_dir = repel.normalize_or_zero();
+                        let escape = if active_food_wall_jam_context {
+                            move_dir * 0.02 + tangent * 7.00 + crowd_dir * 3.00
+                        } else {
+                            move_dir * 0.12 + tangent * 4.20 + crowd_dir * 2.00
+                        }
+                        .normalize_or_zero();
+                        if escape.length_squared() > 0.0 {
+                            h = escape.y.atan2(escape.x);
+                            self.ants[idx].heading = h;
+                            self.ants[idx].target_heading = h;
+                        }
                     }
                 }
                 let blocked_home_aim = if self.ants[idx].carrying_food {
@@ -1453,20 +2213,30 @@ impl World {
                     && !used_return_path
                     && self.heading_hits_wall(self.ants[idx].pos, h, SENSOR_DIST * 3.0);
                 if blocked_home_aim || imminent_wall_without_route {
-                    let preferred_side = if (self.ants[idx].pos.y - self.nest.pos.y).abs() > 24.0 {
-                        if self.ants[idx].pos.y < self.nest.pos.y {
-                            -1.0
-                        } else {
-                            1.0
-                        }
+                    let first = h + std::f32::consts::FRAC_PI_2;
+                    let second = h - std::f32::consts::FRAC_PI_2;
+                    let vertical_escape = if (self.ants[idx].pos.y - self.nest.pos.y).abs() > 24.0 {
+                        (self.ants[idx].pos.y - self.nest.pos.y).signum()
                     } else if (self.ants[idx].id ^ self.tick) & 1 == 0 {
                         -1.0
                     } else {
                         1.0
                     };
-                    let first = h + preferred_side * std::f32::consts::FRAC_PI_2;
-                    let second = h - preferred_side * std::f32::consts::FRAC_PI_2;
-                    h = if !self.heading_hits_wall(self.ants[idx].pos, first, SENSOR_DIST * 2.0) {
+                    let first_hits =
+                        self.heading_hits_wall(self.ants[idx].pos, first, SENSOR_DIST * 2.0);
+                    let second_hits =
+                        self.heading_hits_wall(self.ants[idx].pos, second, SENSOR_DIST * 2.0);
+                    let first_score = if first_hits {
+                        -10.0
+                    } else {
+                        Vec2::new(first.cos(), first.sin()).y * vertical_escape
+                    };
+                    let second_score = if second_hits {
+                        -10.0
+                    } else {
+                        Vec2::new(second.cos(), second.sin()).y * vertical_escape
+                    };
+                    h = if first_score >= second_score {
                         first
                     } else {
                         second
@@ -1477,10 +2247,9 @@ impl World {
                 if self.ants[idx].carrying_food
                     && !used_return_path
                     && self.ants[idx].since_state_change <= CARRIER_DIRECT_HOME_GUARD_TICKS
-                    && self.ants[idx].pos.distance_squared(self.nest.pos)
-                        > CARRIER_DIRECT_HOME_MIN_DIST.powi(2)
-                    && self.ants[idx].pos.distance_squared(self.nest.pos)
-                        <= CARRIER_DIRECT_HOME_MAX_DIST.powi(2)
+                    && self.ants[idx].pickup_home_dist > CARRIER_DIRECT_HOME_MIN_DIST
+                    && self.ants[idx].pickup_home_dist <= CARRIER_DIRECT_HOME_MAX_DIST
+                    && self.ants[idx].pos.distance_squared(self.nest.pos) > 80.0_f32.powi(2)
                 {
                     // Fresh short-range pickups must search/curve before they
                     // settle onto a return trail. This block only turns away
@@ -1532,18 +2301,44 @@ impl World {
                         self.ants[idx].target_heading = h;
                     }
                 }
+                if self.config.worker_brain_kind == WorkerBrainKind::Weighted
+                    && self.ants[idx].carrying_food
+                    && !self.has_walls
+                    && self.ants[idx].since_state_change <= CARRIER_DIRECT_HOME_GUARD_TICKS
+                    && self.ants[idx].pickup_home_dist > CARRIER_DIRECT_HOME_MAX_DIST
+                    && self.ants[idx].pos.distance_squared(self.nest.pos) > 80.0_f32.powi(2)
+                {
+                    let weighted_cfg = weighted_world_runtime_config();
+                    let to_nest = (self.nest.pos - self.ants[idx].pos).normalize_or_zero();
+                    let heading = Vec2::new(h.cos(), h.sin());
+                    if to_nest.length_squared() > 0.0
+                        && heading.dot(to_nest) >= weighted_cfg.long_return_direct_dot
+                    {
+                        let cross = to_nest.x * heading.y - to_nest.y * heading.x;
+                        let side = if cross.abs() > 0.02 {
+                            cross.signum()
+                        } else if (self.ants[idx].id ^ (self.tick / 18)) & 1 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        let tangent = Vec2::new(-to_nest.y, to_nest.x) * side;
+                        let bent = (to_nest * weighted_cfg.long_return_forward
+                            + tangent * weighted_cfg.long_return_lateral)
+                            .normalize_or_zero();
+                        if bent.length_squared() > 0.0 {
+                            h = blend_angle(
+                                h,
+                                bent.y.atan2(bent.x),
+                                weighted_cfg.long_return_bend_blend,
+                            );
+                            self.ants[idx].heading = h;
+                            self.ants[idx].target_heading = h;
+                        }
+                    }
+                }
                 if self.ants[idx].carrying_food {
                     let pos = self.ants[idx].pos;
-                    let adjusted_h = self.no_gps_carrier_heading(
-                        self.ants[idx].id,
-                        self.ants[idx].pickup_home_dist,
-                        pos,
-                        h,
-                    );
-                    if adjusted_h != h {
-                        h = adjusted_h;
-                        self.ants[idx].heading = h;
-                    }
                     let wall_safe_h = self.avoid_blocked_home_heading(self.ants[idx].id, pos, h);
                     if wall_safe_h != h {
                         h = wall_safe_h;
@@ -1588,23 +2383,15 @@ impl World {
                     self.ants[idx].pos.y = ny.clamp(0.5, self.height - 0.5);
                 }
                 if self.ants[idx].carrying_food {
-                    let mut final_h = self.no_gps_carrier_heading(
+                    let final_h = self.avoid_blocked_home_heading(
                         self.ants[idx].id,
-                        self.ants[idx].pickup_home_dist,
                         self.ants[idx].pos,
                         self.ants[idx].heading,
-                    );
-                    final_h = self.avoid_blocked_home_heading(
-                        self.ants[idx].id,
-                        self.ants[idx].pos,
-                        final_h,
                     );
                     self.ants[idx].heading = final_h;
                     self.ants[idx].target_heading = final_h;
                 }
-                if !self.ants[idx].carrying_food
-                    && !self.near_wall(self.ants[idx].pos, self.wall_cell_size * 3.0)
-                {
+                if !self.ants[idx].carrying_food {
                     let should_push = self.ants[idx].breadcrumbs.last().map_or(true, |p| {
                         self.ants[idx].pos.distance_squared(*p) >= BREADCRUMB_MIN_DIST.powi(2)
                     });
@@ -1627,11 +2414,6 @@ impl World {
                     .iter()
                     .position(|f| f.pos.distance(pos) < PICKUP_RADIUS && f.amount > 0.0)
                 {
-                    // A "corpse-food" pile has amount < 1.0 (decomposed
-                    // corpses produce 0.5-unit piles). Detect & count.
-                    if self.food[fi].amount < 1.0 {
-                        self.corpse_pickup_total += 1;
-                    }
                     self.food[fi].amount -= 1.0;
                     self.ants[idx].carrying_food = true;
                     self.ants[idx].pickup_home_dist = pos.distance(self.nest.pos);
@@ -1653,13 +2435,20 @@ impl World {
                         p.distance_squared(self.nest.pos) <= 40.0_f32.powi(2)
                     });
                     let non_direct_route = route_is_non_direct(&filtered_route, self.nest.pos, pos);
-                    if has_nest_anchor && non_direct_route && filtered_route.len() >= 4 {
-                        if self.has_walls {
-                            self.ants[idx].return_path = filtered_route;
+                    if has_nest_anchor
+                        && filtered_route.len() >= 4
+                        && (non_direct_route || self.has_walls)
+                    {
+                        self.ants[idx].return_path = if self.has_walls {
+                            filtered_route
                         } else {
-                            self.ants[idx].return_path =
-                                filtered_route.iter().rev().copied().collect();
-                        }
+                            open_return_route_memory(
+                                &filtered_route,
+                                self.nest.pos,
+                                pos,
+                                self.ants[idx].id,
+                            )
+                        };
                     } else {
                         self.ants[idx].return_path.clear();
                     }
@@ -1750,11 +2539,50 @@ impl World {
                 }
             }
             Action::LayPheromone { channel, strength } => {
-                let pos = self.ants[idx].pos;
+                let pos = (self.ants[idx].pos
+                    + noise_offset(id, self.tick, 500, self.config.deposit_position_noise))
+                .clamp(
+                    Vec2::splat(0.5),
+                    Vec2::new(self.width - 0.5, self.height - 0.5),
+                );
+                let strength =
+                    strength * noise_scale(id, self.tick, 501, self.config.deposit_strength_noise);
                 let trail_channel =
                     matches!(channel, PheromoneChannel::Food | PheromoneChannel::Home);
+                let blocked_wall_food_deposit = if self.has_walls
+                    && self.ants[idx].carrying_food
+                    && matches!(channel, PheromoneChannel::Food)
+                {
+                    let weighted_deposit_filter =
+                        self.config.worker_brain_kind == WorkerBrainKind::Weighted;
+                    let weighted_band = weighted_world_runtime_config().blocked_home_deposit_band;
+                    let band = if weighted_deposit_filter {
+                        weighted_band
+                    } else {
+                        weighted_band.max(70.0)
+                    };
+                    let to_nest = self.nest.pos - pos;
+                    let direct_home_blocked = band > 0.0
+                        && to_nest.length_squared() > 1.0
+                        && (pos.y - self.nest.pos.y).abs() <= band
+                        && self.heading_hits_wall(
+                            pos,
+                            to_nest.y.atan2(to_nest.x),
+                            to_nest.length(),
+                        );
+                    let current_wall_blocked = self.near_wall(pos, self.wall_cell_size * 5.0)
+                        && self.heading_hits_wall(pos, self.ants[idx].heading, SENSOR_DIST * 4.0);
+                    if weighted_deposit_filter {
+                        direct_home_blocked
+                    } else {
+                        direct_home_blocked || current_wall_blocked
+                    }
+                } else {
+                    false
+                };
                 if !self.obstacle_at(pos)
                     && (!trail_channel || !self.near_wall(pos, self.wall_cell_size * 1.5))
+                    && !blocked_wall_food_deposit
                 {
                     if self.config.bilinear_deposit {
                         self.pheromones.deposit_bilinear(channel, pos, strength);

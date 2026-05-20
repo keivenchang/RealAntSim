@@ -186,9 +186,7 @@ ever done, the profile is useful for CPU tuning. After that:
   grid; on GPU this becomes sort-then-scan
 - `backend/src/brains.rs` — five algorithms, each ~50 lines of
   scoring code. Refactor to a single function selected by `nav_algo`
-- The bench loop in `backend/src/main.rs::run_path_regression` is
-  already rayon-parallel across combos — Phase 5 replaces the
-  par_iter with a single GPU kernel launch over packed combos.
+- The canonical bench loop is `backend/src/main.rs::run_default_bench`, which calls `evaluate_bench_row` and reports normalized `0.0..100.0` scores; Phase 5 replaces the per-row CPU work with a single GPU kernel launch over packed bench rows.
 
 ## Parallel CPU/GPU development
 

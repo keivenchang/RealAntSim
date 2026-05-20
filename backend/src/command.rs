@@ -6,6 +6,7 @@
 //!   {"op":"spawn_food"}
 //!   {"op":"reset"}
 
+use crate::brain::WorkerBrainKind;
 use crate::world::World;
 use serde::Deserialize;
 
@@ -47,8 +48,8 @@ pub enum Command {
     LoadScenario {
         name: String,
     },
-    /// Kill every (non-queen) ant within `radius` of (`x`, `y`). Their
-    /// corpses go into the normal decomposition pipeline.
+    /// Kill every (non-queen) ant within `radius` of (`x`, `y`). Dead ants
+    /// are removed immediately; they do not become corpses or food.
     SprayPesticide {
         x: f32,
         y: f32,
@@ -66,6 +67,9 @@ pub enum Command {
     TogglePause,
     SetMaxColonySize {
         value: u32,
+    },
+    SetWorkerBrain {
+        value: WorkerBrainKind,
     },
 }
 
@@ -94,6 +98,7 @@ pub fn apply(world: &mut World, cmd: Command) {
             let prev_config = world.config.clone();
             *world = World::new(w, h);
             world.config = prev_config;
+            world.rebuild_worker_brains();
         }
         Command::KillQueen => {
             if let Some(qid) = world.nest.queen_id {
@@ -168,6 +173,9 @@ pub fn apply(world: &mut World, cmd: Command) {
         Command::SetMaxColonySize { value } => {
             world.config.max_colony_size = value.clamp(10, 5000);
         }
+        Command::SetWorkerBrain { value } => {
+            world.set_worker_brain_kind(value);
+        }
     }
 }
 
@@ -215,6 +223,46 @@ mod tests {
 
         assert_eq!(world.food.len(), 1);
         assert_eq!(world.food[0].amount, 900.0);
+    }
+
+    #[test]
+    fn worker_brain_command_updates_config() {
+        let mut world = World::new(300.0, 300.0);
+
+        apply(
+            &mut world,
+            Command::SetWorkerBrain {
+                value: WorkerBrainKind::Weighted,
+            },
+        );
+
+        assert_eq!(world.config.worker_brain_kind, WorkerBrainKind::Weighted);
+    }
+
+    #[test]
+    fn worker_brain_command_accepts_snake_case_json() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"op":"set_worker_brain","value":"weighted"}"#).unwrap();
+
+        assert!(matches!(
+            cmd,
+            Command::SetWorkerBrain {
+                value: WorkerBrainKind::Weighted
+            }
+        ));
+    }
+
+    #[test]
+    fn worker_brain_command_accepts_neural_json() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"op":"set_worker_brain","value":"neural"}"#).unwrap();
+
+        assert!(matches!(
+            cmd,
+            Command::SetWorkerBrain {
+                value: WorkerBrainKind::Neural
+            }
+        ));
     }
 
     #[test]

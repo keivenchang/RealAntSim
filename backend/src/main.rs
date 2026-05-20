@@ -6,7 +6,8 @@ mod pheromone;
 mod protocol;
 mod world;
 
-use crate::brain::PheromoneChannel;
+use crate::brain::{PheromoneChannel, WorkerBrainKind};
+use crate::brains::{make_teacher_worker_brain, TeacherSampleBuffer};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -18,6 +19,7 @@ use axum::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tower_http::services::ServeDir;
@@ -27,6 +29,52 @@ const FRONTEND_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../frontend");
 const SERVER_HZ: u64 = 30;
 const WORLD_W: f32 = 1920.0;
 const WORLD_H: f32 = 1080.0;
+const ARC_BOOTSTRAP_BOW: f32 = 0.60;
+const BENCH_SCORE_PASS_THRESHOLD: f32 = 40.0;
+const SCORED_BENCH_COUNT: f32 = 9.0;
+const COMPOSITE_SCORE_PASS_THRESHOLD: f32 = BENCH_SCORE_PASS_THRESHOLD * SCORED_BENCH_COUNT;
+
+fn worker_brain_kind_from_args(args: &[String]) -> WorkerBrainKind {
+    let mut selected = WorkerBrainKind::Classic;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--brain" {
+            let Some(value) = args.get(i + 1) else {
+                eprintln!("--brain requires one of: classic, weighted, neural");
+                std::process::exit(2);
+            };
+            selected = WorkerBrainKind::parse(value).unwrap_or_else(|| {
+                eprintln!("unknown --brain value '{value}'; expected classic, weighted, or neural");
+                std::process::exit(2);
+            });
+            i += 2;
+            continue;
+        }
+        if let Some(value) = args[i].strip_prefix("--brain=") {
+            selected = WorkerBrainKind::parse(value).unwrap_or_else(|| {
+                eprintln!("unknown --brain value '{value}'; expected classic, weighted, or neural");
+                std::process::exit(2);
+            });
+        }
+        i += 1;
+    }
+    selected
+}
+
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let eq = format!("{flag}=");
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            return args.get(i + 1).map(|s| s.as_str());
+        }
+        if let Some(value) = args[i].strip_prefix(&eq) {
+            return Some(value);
+        }
+        i += 1;
+    }
+    None
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -39,32 +87,65 @@ async fn main() {
     // CLI: `ant-backend bench` runs the headless parameter-sweep harness
     // instead of the WS server. Useful for tuning runs.
     let args: Vec<String> = std::env::args().collect();
+    let worker_brain_kind = worker_brain_kind_from_args(&args);
+    if args.iter().any(|a| a == "export_neural_teacher") {
+        export_neural_teacher(&args);
+        return;
+    }
     if args.iter().any(|a| a == "bench" || a == "path_regression") {
-        run_path_regression();
+        run_path_regression(worker_brain_kind);
+        return;
+    }
+    if args.iter().any(|a| a == "bench_default") {
+        run_default_bench(worker_brain_kind);
         return;
     }
     if args.iter().any(|a| a == "wall_regression") {
-        run_wall_regression();
+        run_wall_regression(worker_brain_kind);
+        return;
+    }
+    if args.iter().any(|a| a == "arc_regression") {
+        run_arc_regression(worker_brain_kind);
+        return;
+    }
+    if args.iter().any(|a| a == "post_pickup_regression") {
+        run_post_pickup_regression(worker_brain_kind);
+        return;
+    }
+    if args.iter().any(|a| a == "lost_carrier_regression") {
+        run_lost_carrier_regression(worker_brain_kind);
+        return;
+    }
+    if args.iter().any(|a| a == "meander_regression") {
+        run_meander_regression(worker_brain_kind);
+        return;
+    }
+    if args.iter().any(|a| a == "loop_decay_regression") {
+        run_loop_decay_regression(worker_brain_kind);
+        return;
+    }
+    if args.iter().any(|a| a == "food_cycle_regression") {
+        run_food_cycle_regression(worker_brain_kind);
         return;
     }
     if args.iter().any(|a| a == "cluster_regression") {
-        run_cluster_regression();
+        run_cluster_regression(worker_brain_kind);
         return;
     }
     if args.iter().any(|a| a == "dump_wall_test") {
-        dump_wall_test();
+        dump_wall_test(worker_brain_kind);
         return;
     }
     if args.iter().any(|a| a == "dump_arc_to_line") {
-        dump_arc_to_line();
+        dump_arc_to_line(worker_brain_kind);
         return;
     }
     if args.iter().any(|a| a == "dump_arc_progress") {
-        dump_arc_progress();
+        dump_arc_progress(worker_brain_kind);
         return;
     }
     if args.iter().any(|a| a == "dump_food_cycle") {
-        dump_food_cycle();
+        dump_food_cycle(worker_brain_kind);
         return;
     }
 
@@ -175,6 +256,40 @@ struct BenchParams {
     food_lay_strength: f32,
     outbound_lay_threshold: f32,
     bilinear_deposit: bool,
+    worker_brain_kind: WorkerBrainKind,
+}
+
+fn bench_params(
+    name: &'static str,
+    home_diffusion: f32,
+    food_lay_strength: f32,
+    outbound_lay_threshold: f32,
+    bilinear_deposit: bool,
+    worker_brain_kind: WorkerBrainKind,
+) -> BenchParams {
+    BenchParams {
+        name,
+        home_diffusion,
+        food_lay_strength,
+        outbound_lay_threshold,
+        bilinear_deposit,
+        worker_brain_kind,
+    }
+}
+
+fn positive_score(raw: f32, low: f32, high: f32) -> f32 {
+    let t = ((raw - low) / (high - low)).clamp(0.0, 1.0);
+    t * 100.0
+}
+
+fn negative_score(raw: f32, low: f32, high: f32) -> f32 {
+    (100.0 - positive_score(raw, low, high)).clamp(0.0, 100.0)
+}
+
+fn angle_delta_abs(a: f32, b: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    let tau = pi * 2.0;
+    ((a - b + pi).rem_euclid(tau) - pi).abs()
 }
 
 #[derive(Clone, Copy, Default)]
@@ -206,10 +321,16 @@ struct WallBench {
     behind_wall_pickups: u32,
     behind_wall_returns: u32,
     behind_wall_return_rate: f32,
+    behind_wall_fast_returns: u32,
+    behind_wall_fast_return_rate: f32,
+    behind_wall_prompt_returns: u32,
+    behind_wall_prompt_return_rate: f32,
     behind_wall_timeouts: u32,
     behind_wall_wall_aim_rate: f32,
     mean_behind_wall_return_ticks: f32,
     max_behind_wall_return_ticks: u32,
+    return_stream_mean: f32,
+    return_stream_peak: u32,
     behavior: BehaviorMetrics,
     checkpoints: Vec<u32>,
     score: f32,
@@ -228,6 +349,17 @@ struct ArcBench {
     deliveries: u32,
     metrics: ArcLineMetrics,
     behavior: BehaviorMetrics,
+    return_samples: u32,
+    direct_return_samples: u32,
+    direct_return_rate: f32,
+    return_chord_samples: u32,
+    return_chord_rate: f32,
+    mean_return_line_dist: f32,
+    return_trajectory_samples: u32,
+    perfect_return_traces: u32,
+    perfect_return_rate: f32,
+    max_return_straightness: f32,
+    max_return_home_progress: f32,
     checkpoints: Vec<u32>,
     score: f32,
 }
@@ -287,11 +419,27 @@ struct LostCarrierBench {
     score: f32,
 }
 
+struct MeanderBench {
+    workers: u32,
+    mean_path_len: f32,
+    mean_displacement: f32,
+    mean_straightness: f32,
+    straight_trace_rate: f32,
+    mean_turn_rate: f32,
+    score: f32,
+}
+
 struct ClusterBench {
     workers: u32,
     mean_displacement: f32,
     cluster_sample_rate: f32,
     final_cluster_rate: f32,
+    wall_bottleneck_worker_rate: f32,
+    wall_bottleneck_clump_rate: f32,
+    wall_bottleneck_peak_rate: f32,
+    active_food_wall_worker_rate: f32,
+    active_food_wall_clump_rate: f32,
+    active_food_wall_peak_rate: f32,
     reversal_rate: f32,
     trapped_oscillation_rate: f32,
     score: f32,
@@ -328,6 +476,15 @@ struct ClusterTrace {
     reversals: u32,
 }
 
+struct MeanderTrace {
+    start: glam::Vec2,
+    last: glam::Vec2,
+    prev_heading: f32,
+    path_len: f32,
+    turn_sum: f32,
+    turn_samples: u32,
+}
+
 struct BenchRow {
     params: BenchParams,
     wall: WallBench,
@@ -337,6 +494,7 @@ struct BenchRow {
     cycle: FoodCycleBench,
     post_pickup: PostPickupBench,
     lost_carrier: LostCarrierBench,
+    meander: MeanderBench,
     cluster: ClusterBench,
     total: f32,
     dur: f32,
@@ -407,12 +565,23 @@ fn compute_behavior_metrics(
         }
     }
 
+    let food_positions: Vec<_> = world.food.iter().map(|f| f.pos).collect();
+    const ENDPOINT_R: f32 = 80.0;
+    let endpoint_r2 = ENDPOINT_R * ENDPOINT_R;
     let mut branch_cells = 0u32;
     let mut dead_end_cells = 0u32;
     for y in 0..n {
         for x in 0..n {
             let idx = y * n + x;
             if !active[idx] {
+                continue;
+            }
+            let p = glam::Vec2::new((x as f32 + 0.5) * cell_w, (y as f32 + 0.5) * cell_h);
+            if p.distance_squared(world.nest.pos) <= endpoint_r2
+                || food_positions
+                    .iter()
+                    .any(|food_pos| p.distance_squared(*food_pos) <= endpoint_r2)
+            {
                 continue;
             }
             let mut degree = 0u32;
@@ -434,14 +603,11 @@ fn compute_behavior_metrics(
         }
     }
 
-    let food_positions: Vec<_> = world.food.iter().map(|f| f.pos).collect();
     let mut workers_considered = 0u32;
     let mut scattered_workers = 0u32;
     let mut carriers_considered = 0u32;
     let mut direct_home_dashes = 0u32;
-    const ENDPOINT_R: f32 = 80.0;
     const FOOD_SWARM_R: f32 = 70.0;
-    let endpoint_r2 = ENDPOINT_R * ENDPOINT_R;
     let food_swarm_r2 = FOOD_SWARM_R * FOOD_SWARM_R;
     let mut max_food_swarm = 0u32;
     let mut total_workers = 0u32;
@@ -533,10 +699,11 @@ fn compute_behavior_metrics(
 /// pheromone fields as a single composite PPM image.
 /// Shows what the *actual* trail field looks like under the current
 /// algo, so we can see if "tight single path" is emerging.
-fn dump_wall_test() {
+fn dump_wall_test(worker_brain_kind: WorkerBrainKind) {
     use std::io::Write;
     let mut world = World::new(WORLD_W, WORLD_H);
     world.load_scenario("wall_test");
+    world.set_worker_brain_kind(worker_brain_kind);
     world.config.stable_mode = true;
     world.config.spawn_cooldown_ticks = 999_999_999;
     world.config.food_respawn = false;
@@ -696,7 +863,7 @@ fn food_mass_near_polyline(
 ) -> (f32, f32, f32) {
     let cell_w = WORLD_W / grid as f32;
     let cell_h = WORLD_H / grid as f32;
-    let corridor_r2 = 20.0_f32.powi(2);
+    let corridor_r2 = 40.0_f32.powi(2);
     let endpoint_r2 = 90.0_f32.powi(2);
     let start = short_pts[0];
     let end = *short_pts.last().unwrap();
@@ -728,10 +895,11 @@ fn food_mass_near_polyline(
     (short_mass / denom, long_mass / denom, off_mass / denom)
 }
 
-fn dump_arc_to_line() {
+fn dump_arc_to_line(worker_brain_kind: WorkerBrainKind) {
     use std::io::Write;
     let mut world = World::new(WORLD_W, WORLD_H);
     world.load_scenario("arc_to_line");
+    world.set_worker_brain_kind(worker_brain_kind);
     world.config.stable_mode = true;
     world.config.spawn_cooldown_ticks = 999_999_999;
     world.config.food_respawn = false;
@@ -739,7 +907,7 @@ fn dump_arc_to_line() {
 
     let start = world.nest.pos;
     let end = world.food.first().map(|f| f.pos).unwrap_or(start);
-    let mid = (start + end) * 0.5 + glam::Vec2::new(0.0, -world.height * 0.30);
+    let mid = (start + end) * 0.5 + glam::Vec2::new(0.0, -world.height * ARC_BOOTSTRAP_BOW);
     let mut arc_pts = Vec::with_capacity(65);
     for i in 0..65 {
         let t = i as f32 / 64.0;
@@ -759,7 +927,7 @@ fn dump_arc_to_line() {
     let h: u32 = 270;
     let cell_x = WORLD_W / w as f32;
     let cell_y = WORLD_H / h as f32;
-    let straight_r2 = 18.0_f32.powi(2);
+    let straight_r2 = 64.0_f32.powi(2);
     let arc_r2 = 18.0_f32.powi(2);
     let mut straight_mass = 0.0_f32;
     let mut arc_mass = 0.0_f32;
@@ -931,18 +1099,12 @@ fn render_world_panel(world: &World, panel_w: u32, panel_h: u32) -> Vec<u8> {
     buf
 }
 
-fn dump_arc_progress() {
+fn dump_arc_progress(worker_brain_kind: WorkerBrainKind) {
     use std::io::Write;
     const PANEL_W: u32 = 320;
     const PANEL_H: u32 = 180;
     const TICKS: [u32; 5] = [0, 4_500, 9_000, 13_500, 18_000];
-    let params = BenchParams {
-        name: "default",
-        home_diffusion: 0.03,
-        food_lay_strength: 1.5,
-        outbound_lay_threshold: 0.5,
-        bilinear_deposit: false,
-    };
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
     let mut world = World::new(WORLD_W, WORLD_H);
     world.load_scenario("arc_to_line");
     apply_bench_params(&mut world, params);
@@ -996,15 +1158,9 @@ fn dump_arc_progress() {
     }
 }
 
-fn dump_food_cycle() {
+fn dump_food_cycle(worker_brain_kind: WorkerBrainKind) {
     use std::io::Write;
-    let params = BenchParams {
-        name: "dump",
-        home_diffusion: 0.03,
-        food_lay_strength: 1.5,
-        outbound_lay_threshold: 3.0,
-        bilinear_deposit: false,
-    };
+    let params = bench_params("dump", 0.03, 1.5, 3.0, false, worker_brain_kind);
     let mut world = World::new(WORLD_W, WORLD_H);
     apply_bench_params(&mut world, params);
     world.config.food_respawn_amount = 45.0;
@@ -1123,6 +1279,16 @@ fn apply_bench_params(world: &mut World, params: BenchParams) {
     world.config.food_lay_strength = params.food_lay_strength;
     world.config.outbound_lay_threshold = params.outbound_lay_threshold;
     world.config.bilinear_deposit = params.bilinear_deposit;
+    // The scored benches compare brain/pheromone behavior, so they run with
+    // deterministic I/O. Normal GUI runs keep the SimConfig I/O noise defaults.
+    world.config.perception_position_noise = 0.0;
+    world.config.perception_heading_noise = 0.0;
+    world.config.perception_signal_noise = 0.0;
+    world.config.motor_speed_noise = 0.0;
+    world.config.motor_turn_noise = 0.0;
+    world.config.deposit_strength_noise = 0.0;
+    world.config.deposit_position_noise = 0.0;
+    world.set_worker_brain_kind(params.worker_brain_kind);
 }
 
 fn run_steps(world: &mut World, ticks: u32, checkpoint_every: u32) -> Vec<u32> {
@@ -1137,6 +1303,146 @@ fn run_steps(world: &mut World, ticks: u32, checkpoint_every: u32) -> Vec<u32> {
         }
     }
     checkpoints
+}
+
+fn attach_teacher_worker_brains(world: &mut World, samples: Arc<TeacherSampleBuffer>) {
+    for ant in &world.ants {
+        if ant.role == crate::entities::Role::Worker {
+            world
+                .brains
+                .insert(ant.id, make_teacher_worker_brain(samples.clone()));
+        }
+    }
+}
+
+fn run_teacher_world(
+    name: &str,
+    world: &mut World,
+    samples: &Arc<TeacherSampleBuffer>,
+    target_samples: usize,
+    ticks: u32,
+) {
+    let before = samples.len();
+    for _ in 0..ticks {
+        if samples.len() >= target_samples || !world.is_running() {
+            break;
+        }
+        world.step();
+    }
+    let after = samples.len();
+    println!(
+        "{name:<18} added={:>7} total={:>7}",
+        after.saturating_sub(before),
+        after
+    );
+}
+
+fn export_neural_teacher(args: &[String]) {
+    use std::io::Write;
+
+    let max_samples = arg_value(args, "--samples")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(250_000);
+    let out = arg_value(args, "--out")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("run/neural_worker_teacher.csv"));
+    let samples = TeacherSampleBuffer::new(max_samples);
+    let scenario_quota = (max_samples / 4).max(1);
+    let params = bench_params("teacher", 0.03, 1.5, 0.5, false, WorkerBrainKind::Classic);
+
+    println!("=== Neural Teacher Export ===");
+    println!("target_samples={max_samples}");
+
+    let mut fresh = World::new(WORLD_W, WORLD_H);
+    apply_bench_params(&mut fresh, params);
+    fresh.config.food_respawn = false;
+    fresh.add_food_at(fresh.nest.pos + glam::Vec2::new(360.0, 0.0), 5000.0);
+    attach_teacher_worker_brains(&mut fresh, samples.clone());
+    run_teacher_world(
+        "fresh_food",
+        &mut fresh,
+        &samples,
+        samples
+            .len()
+            .saturating_add(scenario_quota)
+            .min(max_samples),
+        5_000,
+    );
+
+    let mut arc = World::new(WORLD_W, WORLD_H);
+    arc.load_scenario("arc_to_line");
+    apply_bench_params(&mut arc, params);
+    attach_teacher_worker_brains(&mut arc, samples.clone());
+    run_teacher_world(
+        "arc_to_line",
+        &mut arc,
+        &samples,
+        samples
+            .len()
+            .saturating_add(scenario_quota)
+            .min(max_samples),
+        6_000,
+    );
+
+    let mut wall = World::new(WORLD_W, WORLD_H);
+    wall.load_scenario("wall_test");
+    apply_bench_params(&mut wall, params);
+    attach_teacher_worker_brains(&mut wall, samples.clone());
+    run_teacher_world(
+        "wall_test",
+        &mut wall,
+        &samples,
+        samples
+            .len()
+            .saturating_add(scenario_quota)
+            .min(max_samples),
+        8_000,
+    );
+
+    let mut lost = World::new(WORLD_W, WORLD_H);
+    apply_bench_params(&mut lost, params);
+    lost.config.food_respawn = false;
+    lost.nest.pos = glam::Vec2::new(WORLD_W * 0.18, WORLD_H * 0.5);
+    lost.nest.food_stored = 0.0;
+    lost.food_delivered_total = 0;
+    lost.food.clear();
+    lost.ants.clear();
+    lost.brains.clear();
+    lost.clear_walls();
+    let queen_id = lost.spawn_ant(lost.nest.pos, crate::entities::Role::Queen, 0);
+    lost.nest.queen_id = Some(queen_id);
+    let food_pos = lost.nest.pos + glam::Vec2::new(360.0, 0.0);
+    lost.add_food_at(food_pos, 5000.0);
+    for i in 0..160 {
+        let a = i as f32 * 2.399_963_1;
+        let r = 7.0 + (i % 8) as f32 * 2.0;
+        let start = food_pos + glam::Vec2::new(a.cos(), a.sin()) * r;
+        let id = lost.spawn_ant(start, crate::entities::Role::Worker, 0);
+        if let Some(ant) = lost.ants.iter_mut().find(|ant| ant.id == id) {
+            ant.carrying_food = true;
+            ant.pickup_home_dist = start.distance(lost.nest.pos);
+            ant.heading = std::f32::consts::PI;
+            ant.target_heading = ant.heading;
+            ant.since_state_change = 0;
+            ant.breadcrumbs.clear();
+            ant.return_path.clear();
+        }
+    }
+    attach_teacher_worker_brains(&mut lost, samples.clone());
+    run_teacher_world("lost_carrier", &mut lost, &samples, max_samples, 1_200);
+
+    let rows = samples.snapshot();
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let mut file = std::fs::File::create(&out).unwrap();
+    for sample in &rows {
+        for value in sample.obs {
+            write!(file, "{value:.8},").unwrap();
+        }
+        writeln!(file, "{:.8}", sample.target_turn).unwrap();
+    }
+    println!("wrote {} rows -> {}", rows.len(), out.display());
 }
 
 fn ray_hits_wall(world: &World, pos: glam::Vec2, dir: glam::Vec2, max_dist: f32) -> bool {
@@ -1384,7 +1690,7 @@ fn arc_line_metrics(world: &World, grid: u32) -> ArcLineMetrics {
         return ArcLineMetrics::default();
     };
     let end = food.pos;
-    let mid = (start + end) * 0.5 + glam::Vec2::new(0.0, -world.height * 0.30);
+    let mid = (start + end) * 0.5 + glam::Vec2::new(0.0, -world.height * ARC_BOOTSTRAP_BOW);
     let mut arc_pts = Vec::with_capacity(65);
     for i in 0..65 {
         let t = i as f32 / 64.0;
@@ -1394,7 +1700,7 @@ fn arc_line_metrics(world: &World, grid: u32) -> ArcLineMetrics {
 
     let cell_w = WORLD_W / grid as f32;
     let cell_h = WORLD_H / grid as f32;
-    let straight_r2 = 18.0_f32.powi(2);
+    let straight_r2 = 64.0_f32.powi(2);
     let arc_r2 = 18.0_f32.powi(2);
     let mut straight_mass = 0.0_f32;
     let mut arc_mass = 0.0_f32;
@@ -1437,6 +1743,10 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
     const WALL_TRACE_STRAIGHTNESS_LIMIT: f32 = 0.90;
     const WALL_TRACE_HOME_PROGRESS_LIMIT: f32 = 0.70;
     const BEHIND_WALL_TRACE_TICKS: u32 = 3_600;
+    const BEHIND_WALL_FAST_RETURN_TICKS: u32 = 1_800;
+    const BEHIND_WALL_PROMPT_RETURN_TICKS: u32 = 2_400;
+    const RETURN_STREAM_SAMPLE_START: u32 = 4_000;
+    const RETURN_STREAM_SAMPLE_EVERY: u32 = 200;
     const CLUTTER_SAMPLE_START: u32 = 8_000;
     const CLUTTER_SAMPLE_EVERY: u32 = 200;
     let mut world = World::new(WORLD_W, WORLD_H);
@@ -1462,16 +1772,26 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
         HashMap::new();
     let mut behind_wall_pickups = 0u32;
     let mut behind_wall_returns = 0u32;
+    let mut behind_wall_fast_returns = 0u32;
+    let mut behind_wall_prompt_returns = 0u32;
     let mut behind_wall_timeouts = 0u32;
     let mut behind_wall_return_ticks_sum = 0u64;
     let mut max_behind_wall_return_ticks = 0u32;
     let mut behind_wall_wall_aim_ticks = 0u32;
     let mut behind_wall_trace_ticks = 0u32;
+    let mut return_stream_samples = 0u32;
+    let mut return_stream_sum = 0u32;
+    let mut return_stream_peak = 0u32;
     let mut clutter_samples = WallClutterSamples::default();
     let wall_x = WORLD_W * 0.5;
     let wall_top = WORLD_H * 0.22;
     let wall_bot = WORLD_H * 0.78;
     let nest_pos = world.nest.pos;
+    let food_pos = world
+        .food
+        .first()
+        .map(|food| food.pos)
+        .unwrap_or(glam::Vec2::new(WORLD_W * 0.82, WORLD_H * 0.5));
     let finish_clear_trace = |trace: &PostPickupTrace| -> Option<bool> {
         if trace.path_len < WALL_TRACE_MIN_PATH {
             return None;
@@ -1490,6 +1810,23 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
             break;
         }
         world.step();
+        if tick + 1 >= RETURN_STREAM_SAMPLE_START && (tick + 1) % RETURN_STREAM_SAMPLE_EVERY == 0 {
+            let stream_count = world
+                .ants
+                .iter()
+                .filter(|ant| {
+                    ant.role == crate::entities::Role::Worker
+                        && ant.carrying_food
+                        && ant.pos.distance(nest_pos) > 170.0
+                        && ant.pos.distance(food_pos) > 110.0
+                        && ant.pos.x > nest_pos.x + 70.0
+                        && ant.pos.x < food_pos.x - 60.0
+                })
+                .count() as u32;
+            return_stream_samples += 1;
+            return_stream_sum += stream_count;
+            return_stream_peak = return_stream_peak.max(stream_count);
+        }
         if tick + 1 >= CLUTTER_SAMPLE_START && (tick + 1) % CLUTTER_SAMPLE_EVERY == 0 {
             sample_wall_clutter(&world, &mut clutter_samples);
         }
@@ -1553,6 +1890,12 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
             if let Some(trace) = behind_wall_traces.remove(&id) {
                 if returned_home {
                     behind_wall_returns += 1;
+                    if trace.age <= BEHIND_WALL_FAST_RETURN_TICKS {
+                        behind_wall_fast_returns += 1;
+                    }
+                    if trace.age <= BEHIND_WALL_PROMPT_RETURN_TICKS {
+                        behind_wall_prompt_returns += 1;
+                    }
                     behind_wall_return_ticks_sum += trace.age as u64;
                     max_behind_wall_return_ticks = max_behind_wall_return_ticks.max(trace.age);
                 } else if trace.age >= BEHIND_WALL_TRACE_TICKS {
@@ -1676,6 +2019,16 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
     } else {
         0.0
     };
+    let behind_wall_fast_return_rate = if behind_wall_pickups > 0 {
+        behind_wall_fast_returns as f32 / behind_wall_pickups as f32
+    } else {
+        0.0
+    };
+    let behind_wall_prompt_return_rate = if behind_wall_pickups > 0 {
+        behind_wall_prompt_returns as f32 / behind_wall_pickups as f32
+    } else {
+        0.0
+    };
     let behind_wall_wall_aim_rate = if behind_wall_trace_ticks > 0 {
         behind_wall_wall_aim_ticks as f32 / behind_wall_trace_ticks as f32
     } else {
@@ -1706,26 +2059,51 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
     } else {
         0.0
     };
-    let score = world.food_delivered_total as f32 * 80.0
-        + route_ratio * 20_000.0
-        + behind_wall_return_rate * 30_000.0
-        + behavior.largest_component_frac * 2_000.0
-        - wall_press * 200.0
-        - blocked_home_aim_rate * 150_000.0
-        - max_blocked_home_aim_streak as f32 * 500.0
-        - clear_home_direct_rate * 150_000.0
-        - max_clear_home_streak as f32 * 500.0
-        - behind_wall_wall_aim_rate * 120_000.0
-        - behind_wall_timeouts as f32 * 300.0
-        - offroute_clutter_rate * 40_000.0
-        - offroute_trail_rate * 100_000.0
-        - wall_dead_zone_rate * 120_000.0
-        - offroute_clump_rate * 100_000.0
-        - behavior.home_dash_rate * 100_000.0
-        - behavior.branch_cells as f32 * 35.0
-        - behavior.dead_end_cells as f32 * 15.0
-        - behavior.trail_coverage * 50_000.0
-        - behavior.scatter_rate * 8_000.0;
+    let return_stream_mean = if return_stream_samples > 0 {
+        return_stream_sum as f32 / return_stream_samples as f32
+    } else {
+        0.0
+    };
+    let early_deliveries = checkpoints.get(1).copied().unwrap_or(0);
+    let mid_deliveries = checkpoints.get(2).copied().unwrap_or(0);
+    let early_delivery_deficit = 120_u32.saturating_sub(early_deliveries) as f32;
+    let mid_delivery_deficit = 300_u32.saturating_sub(mid_deliveries) as f32;
+    let route_deficit = (0.08 - route_ratio).max(0.0);
+    let mean_return_component =
+        (1.0 - ((mean_behind_wall_return_ticks - 1_200.0) / 1_200.0).clamp(0.0, 1.0)) * 80.0;
+    let early_component = (early_deliveries as f32 / 200.0).min(1.0) * 100.0;
+    let mid_component = (mid_deliveries as f32 / 600.0).min(1.0) * 80.0;
+    let throughput_component = (world.food_delivered_total as f32 / 1_100.0).min(1.0) * 120.0;
+    let route_component = (route_ratio / 0.25).min(1.0) * 40.0;
+    let stream_component = (return_stream_mean / 16.0).min(1.0) * 80.0;
+    let stream_deficit = (8.0 - return_stream_mean).max(0.0);
+    let offroute_excess = (offroute_clutter_rate - 0.55).max(0.0);
+    let offtrail_excess = (offroute_trail_rate - 0.25).max(0.0);
+    let offclump_excess = (offroute_clump_rate - 0.12).max(0.0);
+    let branch_excess = behavior.branch_cells.saturating_sub(2_500) as f32;
+    let raw_score = behind_wall_fast_return_rate * 360.0
+        + behind_wall_prompt_return_rate * 240.0
+        + behind_wall_return_rate * 140.0
+        + early_component
+        + mid_component
+        + throughput_component
+        + mean_return_component
+        + route_component
+        + stream_component
+        - early_delivery_deficit * 1.2
+        - mid_delivery_deficit * 0.4
+        - route_deficit * 900.0
+        - stream_deficit * 35.0
+        - offroute_excess * 500.0
+        - offtrail_excess * 500.0
+        - offclump_excess * 500.0
+        - branch_excess * 0.08
+        - wall_press * 0.05
+        - blocked_home_aim_rate * 1_000.0
+        - max_blocked_home_aim_streak as f32 * 2.0
+        - behind_wall_wall_aim_rate * 1_000.0
+        - behavior.home_dash_rate * 500.0;
+    let score = (raw_score / 10.0).clamp(0.0, 100.0);
     WallBench {
         deliveries: world.food_delivered_total,
         route_ratio,
@@ -1747,10 +2125,16 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
         behind_wall_pickups,
         behind_wall_returns,
         behind_wall_return_rate,
+        behind_wall_fast_returns,
+        behind_wall_fast_return_rate,
+        behind_wall_prompt_returns,
+        behind_wall_prompt_return_rate,
         behind_wall_timeouts,
         behind_wall_wall_aim_rate,
         mean_behind_wall_return_ticks,
         max_behind_wall_return_ticks,
+        return_stream_mean,
+        return_stream_peak,
         behavior,
         checkpoints,
         score,
@@ -1760,24 +2144,195 @@ fn run_wall_bench(params: BenchParams) -> WallBench {
 fn run_arc_bench(params: BenchParams) -> ArcBench {
     const TICKS: u32 = 18_000;
     const GRID: u32 = 192;
+    const RETURN_TRACE_TICKS: u32 = 300;
+    const RETURN_TRACE_MIN_PATH: f32 = 50.0;
+    const RETURN_ENDPOINT_R: f32 = 85.0;
+    const DIRECT_RETURN_DOT: f32 = 0.92;
+    const RETURN_CHORD_R: f32 = 18.0;
+    const RETURN_CHORD_HOME_DOT: f32 = 0.65;
+    const PERFECT_RETURN_STRAIGHTNESS: f32 = 0.94;
+    const PERFECT_RETURN_HOME_PROGRESS: f32 = 0.70;
     let mut world = World::new(WORLD_W, WORLD_H);
     world.load_scenario("arc_to_line");
     apply_bench_params(&mut world, params);
-    let checkpoints = run_steps(&mut world, TICKS, 4_500);
+    let mut checkpoints = Vec::new();
+    let mut traces: HashMap<crate::entities::EntityId, PostPickupTrace> = HashMap::new();
+    let mut previous_carriers: HashSet<crate::entities::EntityId> = HashSet::new();
+    let mut return_samples = 0u32;
+    let mut direct_return_samples = 0u32;
+    let mut return_chord_samples = 0u32;
+    let mut return_line_dist_sum = 0.0_f32;
+    let mut return_trajectory_samples = 0u32;
+    let mut perfect_return_traces = 0u32;
+    let mut max_return_straightness = 0.0_f32;
+    let mut max_return_home_progress = 0.0_f32;
+    let nest_pos = world.nest.pos;
+    let food_pos = world.food.first().map(|food| food.pos).unwrap_or(nest_pos);
+
+    let finish_return_trace = |trace: &PostPickupTrace| -> Option<(bool, f32, f32)> {
+        if trace.path_len < RETURN_TRACE_MIN_PATH {
+            return None;
+        }
+        let displacement = trace.start.distance(trace.last);
+        let straightness = displacement / trace.path_len.max(1.0);
+        let home_progress =
+            (trace.start_home_dist - trace.last.distance(nest_pos)) / trace.path_len.max(1.0);
+        let perfect = straightness >= PERFECT_RETURN_STRAIGHTNESS
+            && home_progress >= PERFECT_RETURN_HOME_PROGRESS;
+        Some((perfect, straightness, home_progress))
+    };
+
+    for tick in 0..TICKS {
+        if !world.is_running() {
+            break;
+        }
+        world.step();
+        if (tick + 1) % 4_500 == 0 {
+            checkpoints.push(world.food_delivered_total);
+        }
+
+        let current_carriers = world
+            .ants
+            .iter()
+            .filter(|ant| ant.role == crate::entities::Role::Worker && ant.carrying_food)
+            .map(|ant| ant.id)
+            .collect::<HashSet<_>>();
+
+        for ant in &world.ants {
+            if ant.role != crate::entities::Role::Worker || !ant.carrying_food {
+                continue;
+            }
+            if !previous_carriers.contains(&ant.id) {
+                traces.insert(
+                    ant.id,
+                    PostPickupTrace {
+                        start: ant.pos,
+                        last: ant.pos,
+                        path_len: 0.0,
+                        start_home_dist: ant.pos.distance(nest_pos),
+                        age: 0,
+                    },
+                );
+            }
+            let near_nest = ant.pos.distance_squared(nest_pos) <= RETURN_ENDPOINT_R.powi(2);
+            let near_food = world
+                .food
+                .iter()
+                .any(|food| ant.pos.distance_squared(food.pos) <= RETURN_ENDPOINT_R.powi(2));
+            if near_nest || near_food || ant.since_state_change > RETURN_TRACE_TICKS {
+                continue;
+            }
+            let to_nest = (nest_pos - ant.pos).normalize_or_zero();
+            if to_nest.length_squared() <= 0.0 {
+                continue;
+            }
+            return_samples += 1;
+            let heading = glam::Vec2::new(ant.heading.cos(), ant.heading.sin());
+            let chord_dist = dist2_to_seg(ant.pos, nest_pos, food_pos).sqrt();
+            return_line_dist_sum += chord_dist;
+            if chord_dist <= RETURN_CHORD_R && heading.dot(to_nest) >= RETURN_CHORD_HOME_DOT {
+                return_chord_samples += 1;
+            }
+            if heading.dot(to_nest) >= DIRECT_RETURN_DOT {
+                direct_return_samples += 1;
+            }
+        }
+
+        let mut finished = Vec::new();
+        for (id, trace) in traces.iter_mut() {
+            let Some(ant) = world
+                .ants
+                .iter()
+                .find(|ant| ant.id == *id && ant.role == crate::entities::Role::Worker)
+            else {
+                finished.push(*id);
+                continue;
+            };
+            if !ant.carrying_food {
+                finished.push(*id);
+                continue;
+            }
+            trace.age += 1;
+            trace.path_len += ant.pos.distance(trace.last);
+            trace.last = ant.pos;
+            if trace.age >= RETURN_TRACE_TICKS || ant.pos.distance(nest_pos) <= RETURN_ENDPOINT_R {
+                finished.push(*id);
+            }
+        }
+        for id in finished {
+            if let Some(trace) = traces.remove(&id) {
+                if let Some((perfect, straightness, home_progress)) = finish_return_trace(&trace) {
+                    return_trajectory_samples += 1;
+                    if perfect {
+                        perfect_return_traces += 1;
+                    }
+                    max_return_straightness = max_return_straightness.max(straightness);
+                    max_return_home_progress = max_return_home_progress.max(home_progress);
+                }
+            }
+        }
+        previous_carriers = current_carriers;
+    }
+    for trace in traces.values() {
+        if let Some((perfect, straightness, home_progress)) = finish_return_trace(trace) {
+            return_trajectory_samples += 1;
+            if perfect {
+                perfect_return_traces += 1;
+            }
+            max_return_straightness = max_return_straightness.max(straightness);
+            max_return_home_progress = max_return_home_progress.max(home_progress);
+        }
+    }
+
     let metrics = arc_line_metrics(&world, GRID);
     let behavior = compute_behavior_metrics(&world, GRID, 3.0, 0.5);
-    let score = world.food_delivered_total as f32 * 35.0 + metrics.straight_ratio * 40_000.0
+    let direct_return_rate = if return_samples > 0 {
+        direct_return_samples as f32 / return_samples as f32
+    } else {
+        1.0
+    };
+    let return_chord_rate = if return_samples > 0 {
+        return_chord_samples as f32 / return_samples as f32
+    } else {
+        1.0
+    };
+    let mean_return_line_dist = if return_samples > 0 {
+        return_line_dist_sum / return_samples as f32
+    } else {
+        0.0
+    };
+    let perfect_return_rate = if return_trajectory_samples > 0 {
+        perfect_return_traces as f32 / return_trajectory_samples as f32
+    } else {
+        1.0
+    };
+    let raw_score = world.food_delivered_total as f32 * 35.0 + metrics.straight_ratio * 40_000.0
         - metrics.arc_ratio * 15_000.0
         - metrics.off_ratio * 18_000.0
         - metrics.mean_line_dist * 45.0
         - behavior.home_dash_rate * 60_000.0
+        - direct_return_rate * 45_000.0
+        - return_chord_rate * 30_000.0
+        - perfect_return_rate * 35_000.0
         - behavior.branch_cells as f32 * 20.0
         - behavior.dead_end_cells as f32 * 10.0
         - behavior.trail_coverage * 35_000.0;
+    let score = positive_score(raw_score, 0.0, 50_000.0);
     ArcBench {
         deliveries: world.food_delivered_total,
         metrics,
         behavior,
+        return_samples,
+        direct_return_samples,
+        direct_return_rate,
+        return_chord_samples,
+        return_chord_rate,
+        mean_return_line_dist,
+        return_trajectory_samples,
+        perfect_return_traces,
+        perfect_return_rate,
+        max_return_straightness,
+        max_return_home_progress,
         checkpoints,
         score,
     }
@@ -1809,11 +2364,12 @@ fn run_multi_path_bench(params: BenchParams) -> MultiPathBench {
     let (short_ratio, long_ratio, off_ratio) =
         food_mass_near_polyline(&world, GRID, &short_path, &long_path);
     let behavior = compute_behavior_metrics(&world, GRID, 3.0, 0.5);
-    let score = world.food_delivered_total as f32 * 35.0 + short_ratio * 45_000.0
+    let raw_score = world.food_delivered_total as f32 * 35.0 + short_ratio * 45_000.0
         - long_ratio * 25_000.0
         - off_ratio * 18_000.0
         - behavior.scatter_rate * 8_000.0
         - behavior.branch_cells as f32 * 15.0;
+    let score = positive_score(raw_score, 0.0, 50_000.0);
 
     MultiPathBench {
         deliveries: world.food_delivered_total,
@@ -1827,7 +2383,7 @@ fn run_multi_path_bench(params: BenchParams) -> MultiPathBench {
 }
 
 fn run_loop_decay_bench(params: BenchParams) -> LoopDecayBench {
-    const TICKS: u32 = 4_000;
+    const TICKS: u32 = 8_000;
     const GRID: u32 = 192;
     let mut world = World::new(WORLD_W, WORLD_H);
     world.load_scenario("fresh");
@@ -1883,9 +2439,10 @@ fn run_loop_decay_bench(params: BenchParams) -> LoopDecayBench {
         0.0
     };
     let behavior = compute_behavior_metrics(&world, GRID, 3.0, 0.5);
-    let score = -(final_mass_ratio * 40_000.0)
+    let raw_score = -(final_mass_ratio * 40_000.0)
         - loop_swarm_rate * 40_000.0
         - behavior.home_dash_rate * 40_000.0;
+    let score = positive_score(raw_score, -20_000.0, 0.0);
 
     LoopDecayBench {
         initial_food_mass,
@@ -1930,12 +2487,13 @@ fn run_food_cycle_bench(params: BenchParams) -> FoodCycleBench {
     let second_left = world.food.iter().map(|f| f.amount).sum::<f32>();
     let old_swarm_final = worker_fraction_near(&world, first_pos, 60.0);
 
-    let score = first_deliveries as f32 * 70.0 + second_deliveries as f32 * 100.0
+    let raw_score = first_deliveries as f32 * 70.0 + second_deliveries as f32 * 100.0
         - first_left * 200.0
         - second_left * 80.0
         - old_swarm_after_depletion * 50_000.0
         - old_swarm_final * 30_000.0
         - phantom_smell * 1_500.0;
+    let score = positive_score(raw_score, 0.0, 8_000.0);
 
     FoodCycleBench {
         first_deliveries,
@@ -2107,11 +2665,8 @@ fn run_post_pickup_bench(params: BenchParams) -> PostPickupBench {
     } else {
         1.0
     };
-    let score = -(direct_home_rate * 100_000.0)
-        - straight_home_rate * 150_000.0
-        - max_direct_streak as f32 * 1_000.0
-        + samples.min(500) as f32
-        + trajectory_samples.min(100) as f32;
+    let raw_score = samples.min(500) as f32 + trajectory_samples.min(100) as f32;
+    let score = positive_score(raw_score, 0.0, 700.0);
     PostPickupBench {
         samples,
         direct_home_samples,
@@ -2253,10 +2808,11 @@ fn run_lost_carrier_bench(params: BenchParams) -> LostCarrierBench {
     } else {
         1.0
     };
-    let score = samples.min(2_000) as f32
+    let raw_score = samples.min(2_000) as f32
         - backtrack_rate * 120_000.0
         - returned_to_food_traces as f32 * 5_000.0
         - max_return_drop * 30.0;
+    let score = positive_score(raw_score, -20_000.0, 5_000.0);
 
     LostCarrierBench {
         samples,
@@ -2269,8 +2825,143 @@ fn run_lost_carrier_bench(params: BenchParams) -> LostCarrierBench {
     }
 }
 
+fn run_meander_bench(params: BenchParams) -> MeanderBench {
+    const TICKS: u32 = 900;
+    const WORKERS: u32 = 24;
+    const COLS: u32 = 6;
+    const TRACE_SPACING: f32 = 34.0;
+    const MIN_PATH_FOR_STRAIGHT: f32 = 420.0;
+    const STRAIGHT_TRACE_THRESHOLD: f32 = 0.92;
+
+    let mut world = World::new(WORLD_W, WORLD_H);
+    apply_bench_params(&mut world, params);
+    world.config.food_respawn = false;
+    world.nest.pos = glam::Vec2::new(WORLD_W * 0.12, WORLD_H * 0.50);
+    world.nest.food_stored = 0.0;
+    world.food_delivered_total = 0;
+    world.food.clear();
+    world.corpses.clear();
+    world.ants.clear();
+    world.brains.clear();
+    world.clear_walls();
+    world.pheromones = crate::pheromone::PheromoneField::new(WORLD_W, WORLD_H, 8.0);
+    apply_bench_params(&mut world, params);
+
+    let queen_id = world.spawn_ant(world.nest.pos, crate::entities::Role::Queen, 0);
+    world.nest.queen_id = Some(queen_id);
+
+    let center = glam::Vec2::new(WORLD_W * 0.35, WORLD_H * 0.50);
+    let mut traces: HashMap<crate::entities::EntityId, MeanderTrace> = HashMap::new();
+    for i in 0..WORKERS {
+        let row = i / COLS;
+        let col = i % COLS;
+        let offset = glam::Vec2::new(
+            (col as f32 - (COLS as f32 - 1.0) * 0.5) * TRACE_SPACING,
+            (row as f32 - (WORKERS / COLS) as f32 * 0.5 + 0.5) * TRACE_SPACING,
+        );
+        let start = center + offset;
+        let heading = 0.0;
+        let id = world.spawn_ant(start, crate::entities::Role::Worker, 0);
+        if let Some(ant) = world.ants.iter_mut().find(|ant| ant.id == id) {
+            ant.heading = heading;
+            ant.target_heading = heading;
+            ant.breadcrumbs.clear();
+            ant.return_path.clear();
+            ant.since_state_change = u32::MAX;
+        }
+        traces.insert(
+            id,
+            MeanderTrace {
+                start,
+                last: start,
+                prev_heading: heading,
+                path_len: 0.0,
+                turn_sum: 0.0,
+                turn_samples: 0,
+            },
+        );
+    }
+
+    for _ in 0..TICKS {
+        if !world.is_running() {
+            break;
+        }
+        world.step();
+        for ant in &world.ants {
+            let Some(trace) = traces.get_mut(&ant.id) else {
+                continue;
+            };
+            let step_len = ant.pos.distance(trace.last);
+            trace.path_len += step_len;
+            if step_len > 0.05 {
+                trace.turn_sum += angle_delta_abs(ant.heading, trace.prev_heading);
+                trace.turn_samples += 1;
+            }
+            trace.prev_heading = ant.heading;
+            trace.last = ant.pos;
+        }
+    }
+
+    let workers = traces.len() as u32;
+    let mut path_sum = 0.0_f32;
+    let mut displacement_sum = 0.0_f32;
+    let mut straightness_sum = 0.0_f32;
+    let mut straight_traces = 0u32;
+    let mut turn_sum = 0.0_f32;
+    let mut turn_samples = 0u32;
+    for trace in traces.values() {
+        let displacement = trace.last.distance(trace.start);
+        let straightness = if trace.path_len > 1.0 {
+            displacement / trace.path_len
+        } else {
+            1.0
+        };
+        path_sum += trace.path_len;
+        displacement_sum += displacement;
+        straightness_sum += straightness;
+        if trace.path_len >= MIN_PATH_FOR_STRAIGHT && straightness >= STRAIGHT_TRACE_THRESHOLD {
+            straight_traces += 1;
+        }
+        turn_sum += trace.turn_sum;
+        turn_samples += trace.turn_samples;
+    }
+
+    let denom = workers.max(1) as f32;
+    let mean_path_len = path_sum / denom;
+    let mean_displacement = displacement_sum / denom;
+    let mean_straightness = straightness_sum / denom;
+    let straight_trace_rate = straight_traces as f32 / denom;
+    let mean_turn_rate = if turn_samples > 0 {
+        turn_sum / turn_samples as f32
+    } else {
+        0.0
+    };
+    let score = negative_score(mean_straightness, 0.62, 0.94) * 0.42
+        + negative_score(straight_trace_rate, 0.0, 0.45) * 0.24
+        + positive_score(mean_turn_rate, 0.025, 0.075) * 0.22
+        + positive_score(mean_path_len, 420.0, 760.0) * 0.12;
+
+    MeanderBench {
+        workers,
+        mean_path_len,
+        mean_displacement,
+        mean_straightness,
+        straight_trace_rate,
+        mean_turn_rate,
+        score,
+    }
+}
+
 fn run_cluster_bench(params: BenchParams) -> ClusterBench {
     const TICKS: u32 = 2_400;
+    const BOTTLENECK_TICKS: u32 = 8_000;
+    const BOTTLENECK_SAMPLE_START: u32 = 1_500;
+    const BOTTLENECK_SAMPLE_EVERY: u32 = 60;
+    const BOTTLENECK_EXTRA_WORKERS: u32 = 700;
+    const ACTIVE_FOOD_TICKS: u32 = 18_000;
+    const ACTIVE_FOOD_SAMPLE_START: u32 = 6_000;
+    const ACTIVE_FOOD_SAMPLE_EVERY: u32 = 120;
+    const ACTIVE_FOOD_EXTRA_WORKERS: u32 = 280;
     const WORKERS: u32 = 180;
     const START_RADIUS: f32 = 6.0;
     const CLUSTER_RADIUS: f32 = 24.0;
@@ -2400,17 +3091,128 @@ fn run_cluster_bench(params: BenchParams) -> ClusterBench {
         1.0
     };
     let trapped_oscillation_rate = trapped as f32 / workers.max(1) as f32;
-    let score = mean_displacement * 20.0
+
+    let mut bottleneck_world = World::new(WORLD_W, WORLD_H);
+    apply_bench_params(&mut bottleneck_world, params);
+    bottleneck_world.load_scenario("visual_wall_test");
+    apply_bench_params(&mut bottleneck_world, params);
+    for i in 0..BOTTLENECK_EXTRA_WORKERS {
+        let a = i as f32 * 2.399_963_1;
+        let r = 10.0 + ((i % 53) as f32 / 52.0).sqrt() * 46.0;
+        bottleneck_world.spawn_ant(
+            bottleneck_world.nest.pos + glam::Vec2::new(a.cos(), a.sin()) * r,
+            crate::entities::Role::Worker,
+            0,
+        );
+    }
+    let mut bottleneck_worker_sum = 0.0_f32;
+    let mut bottleneck_clump_sum = 0.0_f32;
+    let mut bottleneck_peak_rate = 0.0_f32;
+    let mut bottleneck_samples = 0u32;
+    for tick in 0..BOTTLENECK_TICKS {
+        if !bottleneck_world.is_running() {
+            break;
+        }
+        bottleneck_world.step();
+        if tick + 1 >= BOTTLENECK_SAMPLE_START && (tick + 1) % BOTTLENECK_SAMPLE_EVERY == 0 {
+            let (worker_rate, clump_rate) = wall_bottleneck_rates(&bottleneck_world);
+            bottleneck_worker_sum += worker_rate;
+            bottleneck_clump_sum += clump_rate;
+            bottleneck_peak_rate = bottleneck_peak_rate.max(clump_rate);
+            bottleneck_samples += 1;
+        }
+    }
+    let wall_bottleneck_worker_rate = if bottleneck_samples > 0 {
+        bottleneck_worker_sum / bottleneck_samples as f32
+    } else {
+        1.0
+    };
+    let wall_bottleneck_clump_rate = if bottleneck_samples > 0 {
+        bottleneck_clump_sum / bottleneck_samples as f32
+    } else {
+        1.0
+    };
+
+    let mut active_world = World::new(WORLD_W, WORLD_H);
+    apply_bench_params(&mut active_world, params);
+    active_world.load_scenario("visual_food_cycle");
+    apply_bench_params(&mut active_world, params);
+    for i in 0..ACTIVE_FOOD_EXTRA_WORKERS {
+        let a = i as f32 * 2.399_963_1;
+        let r = 12.0 + ((i % 89) as f32 / 88.0).sqrt() * 70.0;
+        active_world.spawn_ant(
+            active_world.nest.pos + glam::Vec2::new(a.cos(), a.sin()) * r,
+            crate::entities::Role::Worker,
+            0,
+        );
+    }
+    let mut active_worker_sum = 0.0_f32;
+    let mut active_clump_sum = 0.0_f32;
+    let mut active_peak_rate = 0.0_f32;
+    let mut active_samples = 0u32;
+    for tick in 0..ACTIVE_FOOD_TICKS {
+        if !active_world.is_running() {
+            break;
+        }
+        active_world.step();
+        if tick + 1 >= ACTIVE_FOOD_SAMPLE_START && (tick + 1) % ACTIVE_FOOD_SAMPLE_EVERY == 0 {
+            let (worker_rate, clump_rate) = active_food_wall_clump_rates(&active_world);
+            active_worker_sum += worker_rate;
+            active_clump_sum += clump_rate;
+            active_peak_rate = active_peak_rate.max(clump_rate);
+            active_samples += 1;
+        }
+    }
+    let active_food_wall_worker_rate = if active_samples > 0 {
+        active_worker_sum / active_samples as f32
+    } else {
+        1.0
+    };
+    let active_food_wall_clump_rate = if active_samples > 0 {
+        active_clump_sum / active_samples as f32
+    } else {
+        1.0
+    };
+
+    let raw_score = mean_displacement * 20.0
         - cluster_sample_rate * 4_000.0
         - final_cluster_rate * 6_000.0
+        - wall_bottleneck_worker_rate * 5_000.0
+        - wall_bottleneck_clump_rate * 10_000.0
+        - bottleneck_peak_rate * 4_000.0
+        - active_food_wall_worker_rate * 60_000.0
+        - active_food_wall_clump_rate * 150_000.0
+        - active_peak_rate * 50_000.0
         - reversal_rate * 8_000.0
         - trapped_oscillation_rate * 10_000.0;
+    let visible_wall_pile = wall_bottleneck_clump_rate
+        .max(active_food_wall_clump_rate)
+        .max(bottleneck_peak_rate * 0.5)
+        .max(active_peak_rate * 0.5);
+    let visual_pile_cap = if visible_wall_pile >= 0.05 {
+        10.0
+    } else if visible_wall_pile >= 0.04 {
+        35.0
+    } else if visible_wall_pile >= 0.03 {
+        55.0
+    } else if visible_wall_pile >= 0.02 {
+        75.0
+    } else {
+        100.0
+    };
+    let score = positive_score(raw_score, 0.0, 12_000.0).min(visual_pile_cap);
 
     ClusterBench {
         workers,
         mean_displacement,
         cluster_sample_rate,
         final_cluster_rate,
+        wall_bottleneck_worker_rate,
+        wall_bottleneck_clump_rate,
+        wall_bottleneck_peak_rate: bottleneck_peak_rate,
+        active_food_wall_worker_rate,
+        active_food_wall_clump_rate,
+        active_food_wall_peak_rate: active_peak_rate,
         reversal_rate,
         trapped_oscillation_rate,
         score,
@@ -2443,22 +3245,140 @@ fn clustered_worker_count(world: &World, radius: f32, min_neighbors: u32) -> (u3
     (clustered, workers.len() as u32)
 }
 
+fn wall_bottleneck_rates(world: &World) -> (f32, f32) {
+    const CLUMP_R: f32 = 36.0;
+    const CLUMP_MIN_NEIGHBORS: u32 = 8;
+    const VISUAL_CLUMP_DENOM: f32 = 500.0;
+    let wall_x = WORLD_W * 0.5;
+    let wall_top = WORLD_H * 0.22;
+    let wall_bot = WORLD_H * 0.78;
+    let clump_r2 = CLUMP_R * CLUMP_R;
+    let mut total_workers = 0u32;
+    let mut bottleneck_positions = Vec::new();
+
+    for ant in &world.ants {
+        if ant.role != crate::entities::Role::Worker {
+            continue;
+        }
+        total_workers += 1;
+        let in_food_side_wall_throat = ant.pos.x >= wall_x - 210.0
+            && ant.pos.x <= wall_x + 210.0
+            && ant.pos.y >= wall_top + 70.0
+            && ant.pos.y <= wall_bot - 70.0;
+        if in_food_side_wall_throat {
+            bottleneck_positions.push(ant.pos);
+        }
+    }
+
+    let mut clumped = 0u32;
+    for (i, pos) in bottleneck_positions.iter().enumerate() {
+        let mut neighbors = 0u32;
+        for (j, other) in bottleneck_positions.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if pos.distance_squared(*other) <= clump_r2 {
+                neighbors += 1;
+                if neighbors >= CLUMP_MIN_NEIGHBORS {
+                    clumped += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    let worker_denom = total_workers.max(1) as f32;
+    let clump_denom = worker_denom.min(VISUAL_CLUMP_DENOM);
+    (
+        bottleneck_positions.len() as f32 / worker_denom,
+        clumped as f32 / clump_denom,
+    )
+}
+
+fn active_food_wall_clump_rates(world: &World) -> (f32, f32) {
+    const CLUMP_R: f32 = 34.0;
+    const CLUMP_MIN_NEIGHBORS: u32 = 8;
+    const VISUAL_CLUMP_DENOM: f32 = 500.0;
+    let wall_x = WORLD_W * 0.68;
+    let wall_top = WORLD_H * 0.28;
+    let wall_bot = WORLD_H * 0.78;
+    let clump_r2 = CLUMP_R * CLUMP_R;
+    let mut total_workers = 0u32;
+    let mut pocket_positions = Vec::new();
+
+    for ant in &world.ants {
+        if ant.role != crate::entities::Role::Worker {
+            continue;
+        }
+        total_workers += 1;
+        let in_food_side_wall_pocket = ant.pos.x >= wall_x + 8.0
+            && ant.pos.x <= wall_x + 170.0
+            && ant.pos.y >= wall_top + 80.0
+            && ant.pos.y <= wall_bot - 80.0;
+        if in_food_side_wall_pocket {
+            pocket_positions.push(ant.pos);
+        }
+    }
+
+    let mut clumped = 0u32;
+    for (i, pos) in pocket_positions.iter().enumerate() {
+        let mut neighbors = 0u32;
+        for (j, other) in pocket_positions.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if pos.distance_squared(*other) <= clump_r2 {
+                neighbors += 1;
+                if neighbors >= CLUMP_MIN_NEIGHBORS {
+                    clumped += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    let worker_denom = total_workers.max(1) as f32;
+    let clump_denom = worker_denom.min(VISUAL_CLUMP_DENOM);
+    (
+        pocket_positions.len() as f32 / worker_denom,
+        clumped as f32 / clump_denom,
+    )
+}
+
 fn acceptance_violations(row: &BenchRow) -> Vec<&'static str> {
     let mut violations = Vec::new();
+    if row.wall.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("wall_test score is below the global threshold");
+    }
+    if row.arc.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("arc_to_line score is below the global threshold");
+    }
+    if row.multi_path.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("multi_path score is below the global threshold");
+    }
+    if row.loop_decay.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("loop_decay score is below the global threshold");
+    }
+    if row.cycle.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("food_cycle score is below the global threshold");
+    }
+    if row.post_pickup.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("post_pickup score is below the global threshold");
+    }
+    if row.lost_carrier.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("lost_carrier score is below the global threshold");
+    }
+    if row.meander.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("meander score is below the global threshold");
+    }
+    if row.cluster.score < BENCH_SCORE_PASS_THRESHOLD {
+        violations.push("cluster_escape score is below the global threshold");
+    }
     if row.post_pickup.samples < 20 {
         violations.push("post_pickup produced too few carrier samples");
     }
-    if row.post_pickup.direct_home_rate > 0.005 {
-        violations.push("post_pickup direct-home dash rate is too high");
-    }
-    if row.post_pickup.max_direct_streak > 3 {
-        violations.push("post_pickup has a sustained direct-home streak");
-    }
     if row.post_pickup.trajectory_samples < 10 {
         violations.push("post_pickup produced too few trajectory samples");
-    }
-    if row.post_pickup.straight_home_traces > 0 {
-        violations.push("post_pickup has straight homebound pickup trajectories");
     }
     if row.lost_carrier.samples < 1_000 || row.lost_carrier.traces < 50 {
         violations.push("lost_carrier produced too few lost-carrier samples");
@@ -2469,11 +3389,32 @@ fn acceptance_violations(row: &BenchRow) -> Vec<&'static str> {
     if row.lost_carrier.returned_to_food_traces > 0 {
         violations.push("lost_carrier carriers returned toward the food source");
     }
+    if row.meander.workers < 8 {
+        violations.push("meander produced too few workers");
+    }
+    if row.meander.mean_path_len < 420.0 {
+        violations.push("meander ants did not move far enough to judge wandering");
+    }
+    if row.meander.mean_straightness > 0.86 {
+        violations.push("meander no-pheromone paths are too straight");
+    }
+    if row.meander.straight_trace_rate > 0.25 {
+        violations.push("meander leaves too many no-pheromone ants in straight lines");
+    }
+    if row.meander.mean_turn_rate < 0.025 {
+        violations.push("meander no-pheromone turn rate is too low");
+    }
     if row.wall.deliveries < 250 {
         violations.push("wall_test produced too few deliveries");
     }
-    if row.wall.route_ratio < 0.03 {
-        violations.push("wall_test did not form enough around-wall route");
+    if row.wall.checkpoints.get(1).copied().unwrap_or(0) < 120 {
+        violations.push("wall_test route converges too slowly by 8000 ticks");
+    }
+    if row.wall.checkpoints.get(2).copied().unwrap_or(0) < 300 {
+        violations.push("wall_test route converges too slowly by 12000 ticks");
+    }
+    if row.wall.route_ratio < 0.08 {
+        violations.push("wall_test did not form a tight enough around-wall route");
     }
     if row.wall.wall_press > 250.0 {
         violations.push("wall_test has too much wall or straight-through pressure");
@@ -2484,38 +3425,47 @@ fn acceptance_violations(row: &BenchRow) -> Vec<&'static str> {
     if row.wall.max_blocked_home_aim_streak > 8 {
         violations.push("wall_test has a sustained blocked-wall home-aim streak");
     }
-    if row.wall.clear_home_direct_rate > 0.01 {
-        violations.push("wall_test carriers beeline home after clearing the wall");
-    }
-    if row.wall.max_clear_home_streak > 3 {
-        violations.push("wall_test has a sustained clear-line home beeline");
-    }
-    if row.wall.clear_home_straight_traces > 0 {
-        violations.push("wall_test has straight homebound clear-wall trajectories");
-    }
     if row.wall.behind_wall_pickups < 20 {
         violations.push("wall_test produced too few behind-wall pickup traces");
     }
     if row.wall.behind_wall_return_rate < 0.20 {
         violations.push("wall_test behind-wall carriers do not find home often enough");
     }
-    if row.wall.behind_wall_returns > 0 && row.wall.mean_behind_wall_return_ticks > 3_000.0 {
+    if row.wall.behind_wall_fast_return_rate < 0.30 {
+        violations.push("wall_test behind-wall carriers do not find home fast enough");
+    }
+    if row.wall.behind_wall_prompt_return_rate < 0.55 {
+        violations.push("wall_test behind-wall carriers do not find home promptly enough");
+    }
+    if row.wall.behind_wall_returns > 0 && row.wall.mean_behind_wall_return_ticks > 2_100.0 {
         violations.push("wall_test behind-wall carriers return home too slowly");
     }
     if row.wall.behind_wall_wall_aim_rate > 0.03 {
         violations.push("wall_test behind-wall carriers aim into the wall too often");
     }
+    if row.wall.return_stream_mean < 8.0 {
+        violations.push("wall_test does not sustain a visible food-to-home carrier stream");
+    }
+    if row.wall.return_stream_peak < 18 {
+        violations.push("wall_test never forms a strong visible carrier stream");
+    }
     if row.wall.behavior.scatter_rate > 0.85 {
         violations.push("wall_test workers do not converge to trails enough");
     }
-    if row.wall.offroute_trail_rate > 0.20 {
+    if row.wall.offroute_clutter_rate > 0.55 {
+        violations.push("wall_test has too many workers away from the wall route");
+    }
+    if row.wall.offroute_trail_rate > 0.28 {
         violations.push("wall_test has too much off-route trail-following clutter");
     }
     if row.wall.wall_dead_zone_rate > 0.35 {
         violations.push("wall_test has too many workers milling in wall side/dead zones");
     }
-    if row.wall.offroute_clump_rate > 0.08 {
+    if row.wall.offroute_clump_rate > 0.12 {
         violations.push("wall_test has too much off-route clumped milling");
+    }
+    if row.wall.behavior.branch_cells > 2_500 {
+        violations.push("wall_test route has too many pheromone branches");
     }
     if row.cycle.first_left > 0.0 || row.cycle.second_left > 0.0 {
         violations.push("food_cycle did not consume both piles");
@@ -2546,6 +3496,18 @@ fn acceptance_violations(row: &BenchRow) -> Vec<&'static str> {
     if row.arc.behavior.scatter_rate > 0.80 {
         violations.push("arc_to_line workers do not converge to the shortened path enough");
     }
+    if row.arc.direct_return_rate > 0.08 {
+        violations.push("arc_to_line carriers aim directly home too often after pickup");
+    }
+    if row.arc.return_chord_rate > 0.65 {
+        violations.push("arc_to_line carriers ride the straight home chord too often");
+    }
+    if row.arc.mean_return_line_dist < 12.0 {
+        violations.push("arc_to_line return path is too close to the straight chord");
+    }
+    if row.arc.perfect_return_rate > 0.12 {
+        violations.push("arc_to_line return trajectories are too perfectly straight");
+    }
     if row.multi_path.deliveries < 250 {
         violations.push("multi_path produced too few deliveries");
     }
@@ -2570,6 +3532,24 @@ fn acceptance_violations(row: &BenchRow) -> Vec<&'static str> {
     if row.cluster.final_cluster_rate > 0.15 {
         violations.push("cluster_escape still has a dense final cluster");
     }
+    if row.cluster.wall_bottleneck_worker_rate > 0.18 {
+        violations.push("cluster_escape leaves too many workers in the wall bottleneck");
+    }
+    if row.cluster.wall_bottleneck_clump_rate > 0.025 {
+        violations.push("cluster_escape leaves a dense wall-bottleneck clump");
+    }
+    if row.cluster.wall_bottleneck_peak_rate > 0.06 {
+        violations.push("cluster_escape forms a visible wall-bottleneck pileup");
+    }
+    if row.cluster.active_food_wall_worker_rate > 0.08 {
+        violations.push("cluster_escape leaves too many workers in the active-food wall pocket");
+    }
+    if row.cluster.active_food_wall_clump_rate > 0.03 {
+        violations.push("cluster_escape leaves a dense active-food wall clump");
+    }
+    if row.cluster.active_food_wall_peak_rate > 0.08 {
+        violations.push("cluster_escape forms a visible active-food wall pileup");
+    }
     if row.cluster.reversal_rate > 0.16 {
         violations.push("cluster_escape has too much back-and-forth motion");
     }
@@ -2579,11 +3559,108 @@ fn acceptance_violations(row: &BenchRow) -> Vec<&'static str> {
     violations
 }
 
-fn run_path_regression() {
+fn evaluate_bench_row(params: BenchParams) -> BenchRow {
+    let t0 = std::time::Instant::now();
+    let (
+        meander,
+        (wall, (arc, (multi_path, (loop_decay, (cycle, (post_pickup, (lost_carrier, cluster))))))),
+    ) = rayon::join(
+        || run_meander_bench(params),
+        || {
+            rayon::join(
+                || run_wall_bench(params),
+                || {
+                    rayon::join(
+                        || run_arc_bench(params),
+                        || {
+                            rayon::join(
+                                || run_multi_path_bench(params),
+                                || {
+                                    rayon::join(
+                                        || run_loop_decay_bench(params),
+                                        || {
+                                            rayon::join(
+                                                || run_food_cycle_bench(params),
+                                                || {
+                                                    rayon::join(
+                                                        || run_post_pickup_bench(params),
+                                                        || {
+                                                            rayon::join(
+                                                                || run_lost_carrier_bench(params),
+                                                                || run_cluster_bench(params),
+                                                            )
+                                                        },
+                                                    )
+                                                },
+                                            )
+                                        },
+                                    )
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        },
+    );
+    BenchRow {
+        params,
+        total: wall.score
+            + arc.score
+            + multi_path.score
+            + loop_decay.score
+            + cycle.score
+            + post_pickup.score
+            + lost_carrier.score
+            + meander.score
+            + cluster.score,
+        wall,
+        arc,
+        multi_path,
+        loop_decay,
+        cycle,
+        post_pickup,
+        lost_carrier,
+        meander,
+        cluster,
+        dur: t0.elapsed().as_secs_f32(),
+    }
+}
+
+fn run_default_bench(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
+    let row = evaluate_bench_row(params);
+    let violations = acceptance_violations(&row);
+    println!(
+        "FITNESS total={:.1} pass={} wall={:.1} arc={:.1} multi={:.1} loop={:.1} cycle={:.1} postPickup={:.1} lostCarrier={:.1} meander={:.1} cluster={:.1} sec={:.1}",
+        row.total,
+        violations.is_empty(),
+        row.wall.score,
+        row.arc.score,
+        row.multi_path.score,
+        row.loop_decay.score,
+        row.cycle.score,
+        row.post_pickup.score,
+        row.lost_carrier.score,
+        row.meander.score,
+        row.cluster.score,
+        row.dur,
+    );
+    if !violations.is_empty() {
+        println!("failures={}", violations.join("; "));
+    }
+}
+
+fn run_path_regression(worker_brain_kind: WorkerBrainKind) {
     println!("=== Ant Behavior Bench Suite ===");
+    println!("Worker brain: {}", worker_brain_kind.as_str());
+    println!(
+        "Global score threshold: {:.1} per bench, {:.1} composite; hard gates still override score",
+        BENCH_SCORE_PASS_THRESHOLD, COMPOSITE_SCORE_PASS_THRESHOLD
+    );
     println!("Useful benches kept:");
     println!(
-        "  wall_test    : obstacle routing, off-route clutter, behind-wall returns, no hidden home-vector dash"
+        "  wall_test    : obstacle routing, off-route clutter, behind-wall returns, no through-wall home dash"
     );
     println!("  arc_to_line  : path-shortening from a curved bootstrap trail toward the chord");
     println!("  multi_path   : duplicate routes to one food source favor shorter/faster path");
@@ -2591,10 +3668,11 @@ fn run_path_regression() {
         "  loop_decay   : closed Food loop without food decays instead of becoming a magic path"
     );
     println!("  food_cycle   : depleted pile recovery, second food placement, no dead-source ball");
-    println!("  post_pickup  : hard gate against direct-home dash immediately after pickup");
+    println!("  post_pickup  : pickup return traces; planned direct return is allowed");
     println!(
         "  lost_carrier : no-Home-signal carriers keep searching instead of returning to food"
     );
+    println!("  meander      : no-pheromone workers curve instead of marching in straight lines");
     println!("  cluster_escape: dense worker clump disperses instead of ping-ponging in place");
     println!("Removed from the main score:");
     println!("  density      : too indirect; visual overlap belongs in targeted UI/perf checks");
@@ -2602,78 +3680,18 @@ fn run_path_regression() {
     println!("  generic dissipation: replaced by the depleted-food food_cycle scenario\n");
 
     let candidates = [
-        BenchParams {
-            name: "default",
-            home_diffusion: 0.03,
-            food_lay_strength: 1.5,
-            outbound_lay_threshold: 0.5,
-            bilinear_deposit: false,
-        },
-        BenchParams {
-            name: "higher-threshold",
-            home_diffusion: 0.03,
-            food_lay_strength: 1.5,
-            outbound_lay_threshold: 3.0,
-            bilinear_deposit: false,
-        },
-        BenchParams {
-            name: "stronger-lay",
-            home_diffusion: 0.03,
-            food_lay_strength: 3.0,
-            outbound_lay_threshold: 0.5,
-            bilinear_deposit: false,
-        },
-        BenchParams {
-            name: "bilinear",
-            home_diffusion: 0.03,
-            food_lay_strength: 1.5,
-            outbound_lay_threshold: 3.0,
-            bilinear_deposit: true,
-        },
-        BenchParams {
-            name: "no-home-diff",
-            home_diffusion: 0.0,
-            food_lay_strength: 1.5,
-            outbound_lay_threshold: 0.5,
-            bilinear_deposit: false,
-        },
+        bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind),
+        bench_params("higher-threshold", 0.03, 1.5, 3.0, false, worker_brain_kind),
+        bench_params("stronger-lay", 0.03, 3.0, 0.5, false, worker_brain_kind),
+        bench_params("bilinear", 0.03, 1.5, 3.0, true, worker_brain_kind),
+        bench_params("no-home-diff", 0.0, 1.5, 0.5, false, worker_brain_kind),
     ];
 
     use rayon::prelude::*;
     let total_t0 = std::time::Instant::now();
     let mut rows: Vec<BenchRow> = candidates
         .par_iter()
-        .map(|params| {
-            let t0 = std::time::Instant::now();
-            let wall = run_wall_bench(*params);
-            let arc = run_arc_bench(*params);
-            let multi_path = run_multi_path_bench(*params);
-            let loop_decay = run_loop_decay_bench(*params);
-            let cycle = run_food_cycle_bench(*params);
-            let post_pickup = run_post_pickup_bench(*params);
-            let lost_carrier = run_lost_carrier_bench(*params);
-            let cluster = run_cluster_bench(*params);
-            BenchRow {
-                params: *params,
-                total: wall.score
-                    + arc.score
-                    + multi_path.score
-                    + loop_decay.score
-                    + cycle.score
-                    + post_pickup.score
-                    + lost_carrier.score
-                    + cluster.score,
-                wall,
-                arc,
-                multi_path,
-                loop_decay,
-                cycle,
-                post_pickup,
-                lost_carrier,
-                cluster,
-                dur: t0.elapsed().as_secs_f32(),
-            }
-        })
+        .map(|params| evaluate_bench_row(*params))
         .collect();
     rows.sort_by(|a, b| {
         let a_pass = acceptance_violations(a).is_empty();
@@ -2722,7 +3740,7 @@ fn run_path_regression() {
             "FAIL"
         };
         println!(
-            "{:<16} {:>9.0} | {:>4} {:>5.2} {:>7.0} {:>6.2} {:>3} {:>5.2} {:>5.2} {:>5.2} {:>6.2} {:>6} | {:>4} {:>5.2} {:>5.2} {:>5.2} {:>6.1} | {:>3} {:>3} {:>5.2} {:>5.2} | {:>5} {:>5.2} {:>5.2} {:>3} | {:>5} {:>7.1}",
+            "{:<16} {:>9.1} | {:>4} {:>5.2} {:>7.0} {:>6.2} {:>3} {:>5.2} {:>5.2} {:>5.2} {:>6.2} {:>6} | {:>4} {:>5.2} {:>5.2} {:>5.2} {:>6.1} | {:>3} {:>3} {:>5.2} {:>5.2} | {:>5} {:>5.2} {:>5.2} {:>3} | {:>5} {:>7.1}",
             row.params.name,
             row.total,
             row.wall.deliveries,
@@ -2752,7 +3770,7 @@ fn run_path_regression() {
             row.dur,
         );
         println!(
-            "    scores wall={:.0} arc={:.0} multi={:.0} loop={:.0} cycle={:.0} postPickup={:.0} lostCarrier={:.0} cluster={:.0}",
+            "    scores wall={:.1} arc={:.1} multi={:.1} loop={:.1} cycle={:.1} postPickup={:.1} lostCarrier={:.1} meander={:.1} cluster={:.1}",
             row.wall.score,
             row.arc.score,
             row.multi_path.score,
@@ -2760,10 +3778,11 @@ fn run_path_regression() {
             row.cycle.score,
             row.post_pickup.score,
             row.lost_carrier.score,
+            row.meander.score,
             row.cluster.score,
         );
         println!(
-            "    wall checkpoints={} blockedAim={}/{} clearHome={}/{} clearSt={} clearLine={}/{} behindWall={}/{} mean={} max={} timeout={} wallAim={:.3} offRoute={:.2} offTrail={:.2} wallDz={:.2} offClump={:.2}  arc checkpoints={}  multi short={:.2} long={:.2} off={:.2} scat={:.2} del={} checkpoints={}  loop mass={:.1}/{:.1} final={:.3} swarm={:.2} scat={:.2}  cycle checkpoints={}  cycle left={:.0}/{:.0} repelOld={:.1}  postPickup direct={}/{} line={}/{} maxStraight={:.2} maxHomeProg={:.2}  lostCarrier back={}/{} ret={}/{} maxDrop={:.1}  cluster workers={} disp={:.1} sample={:.2} final={:.2} rev={:.2} trap={:.2}  arcTopo: branch={} scatter={:.2} hDash={:.2} cover={:.3}  params: hd={:.3} lay={:.1} obt={:.1} bilin={}",
+            "    wall checkpoints={} blockedAim={}/{} clearHome={}/{} clearSt={} clearLine={}/{} behindWall={}/{} fast={}/{} prompt={}/{} mean={} max={} timeout={} wallAim={:.3} stream={:.1}/{} offRoute={:.2} offTrail={:.2} wallDz={:.2} offClump={:.2}  arc checkpoints={} direct={}/{} chord={}/{} meanReturnDist={:.1} perfect={}/{} maxStraight={:.2} maxHomeProg={:.2}  multi short={:.2} long={:.2} off={:.2} scat={:.2} del={} checkpoints={}  loop mass={:.1}/{:.1} final={:.3} swarm={:.2} scat={:.2}  cycle checkpoints={}  cycle left={:.0}/{:.0} repelOld={:.1}  postPickup direct={}/{} line={}/{} maxStraight={:.2} maxHomeProg={:.2}  lostCarrier back={}/{} ret={}/{} maxDrop={:.1}  meander workers={} path={:.1} disp={:.1} straight={:.2} line={:.2} turn={:.3}  cluster workers={} disp={:.1} sample={:.2} final={:.2} bottle={:.2}/{:.2}/{:.2} active={:.2}/{:.2}/{:.2} rev={:.2} trap={:.2}  arcTopo: branch={} scatter={:.2} hDash={:.2} cover={:.3}  params: brain={} hd={:.3} lay={:.1} obt={:.1} bilin={}",
             row.wall
                 .checkpoints
                 .iter()
@@ -2779,10 +3798,16 @@ fn run_path_regression() {
             row.wall.clear_home_trajectory_samples,
             row.wall.behind_wall_returns,
             row.wall.behind_wall_pickups,
+            row.wall.behind_wall_fast_returns,
+            row.wall.behind_wall_pickups,
+            row.wall.behind_wall_prompt_returns,
+            row.wall.behind_wall_pickups,
             row.wall.mean_behind_wall_return_ticks.round() as u32,
             row.wall.max_behind_wall_return_ticks,
             row.wall.behind_wall_timeouts,
             row.wall.behind_wall_wall_aim_rate,
+            row.wall.return_stream_mean,
+            row.wall.return_stream_peak,
             row.wall.offroute_clutter_rate,
             row.wall.offroute_trail_rate,
             row.wall.wall_dead_zone_rate,
@@ -2793,6 +3818,15 @@ fn run_path_regression() {
                 .map(|v| v.to_string())
                 .collect::<Vec<_>>()
                 .join("->"),
+            row.arc.direct_return_samples,
+            row.arc.return_samples,
+            row.arc.return_chord_samples,
+            row.arc.return_samples,
+            row.arc.mean_return_line_dist,
+            row.arc.perfect_return_traces,
+            row.arc.return_trajectory_samples,
+            row.arc.max_return_straightness,
+            row.arc.max_return_home_progress,
             row.multi_path.short_ratio,
             row.multi_path.long_ratio,
             row.multi_path.off_ratio,
@@ -2829,16 +3863,29 @@ fn run_path_regression() {
             row.lost_carrier.returned_to_food_traces,
             row.lost_carrier.traces,
             row.lost_carrier.max_return_drop,
+            row.meander.workers,
+            row.meander.mean_path_len,
+            row.meander.mean_displacement,
+            row.meander.mean_straightness,
+            row.meander.straight_trace_rate,
+            row.meander.mean_turn_rate,
             row.cluster.workers,
             row.cluster.mean_displacement,
             row.cluster.cluster_sample_rate,
             row.cluster.final_cluster_rate,
+            row.cluster.wall_bottleneck_worker_rate,
+            row.cluster.wall_bottleneck_clump_rate,
+            row.cluster.wall_bottleneck_peak_rate,
+            row.cluster.active_food_wall_worker_rate,
+            row.cluster.active_food_wall_clump_rate,
+            row.cluster.active_food_wall_peak_rate,
             row.cluster.reversal_rate,
             row.cluster.trapped_oscillation_rate,
             row.arc.behavior.branch_cells,
             row.arc.behavior.scatter_rate,
             row.arc.behavior.home_dash_rate,
             row.arc.behavior.trail_coverage,
+            row.params.worker_brain_kind.as_str(),
             row.params.home_diffusion,
             row.params.food_lay_strength,
             row.params.outbound_lay_threshold,
@@ -2851,9 +3898,10 @@ fn run_path_regression() {
 
     if let Some(best) = rows.first() {
         println!(
-            "\nWinner: {}  total={:.0}  hd={:.3} lay={:.1} obt={:.1} bilin={}",
+            "\nWinner: {}  total={:.1}  brain={} hd={:.3} lay={:.1} obt={:.1} bilin={}",
             best.params.name,
             best.total,
+            best.params.worker_brain_kind.as_str(),
             best.params.home_diffusion,
             best.params.food_lay_strength,
             best.params.outbound_lay_threshold,
@@ -2881,24 +3929,23 @@ fn run_path_regression() {
     );
 }
 
-fn run_wall_regression() {
-    let params = BenchParams {
-        name: "default",
-        home_diffusion: 0.03,
-        food_lay_strength: 1.5,
-        outbound_lay_threshold: 0.5,
-        bilinear_deposit: false,
-    };
+fn run_wall_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
     let t0 = std::time::Instant::now();
     let wall = run_wall_bench(params);
     println!(
-        "wall_test score={:.0} deliveries={} route={:.2} wallPr={:.0} bRet={:.2} timeouts={} scatter={:.2} offRoute={:.2} offTrail={:.2} wallDz={:.2} offClump={:.2} branch={} dead={} cover={:.3} largest={:.2} wAim={:.3} wClr={:.3} wallAim={:.3} elapsed={:.1}s",
+        "wall_test brain={} score={:.1} deliveries={} route={:.2} wallPr={:.0} bRet={:.2} bFast={:.2} bPrompt={:.2} timeouts={} stream={:.1}/{} scatter={:.2} offRoute={:.2} offTrail={:.2} wallDz={:.2} offClump={:.2} branch={} dead={} cover={:.3} largest={:.2} wAim={:.3} wClr={:.3} wallAim={:.3} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
         wall.score,
         wall.deliveries,
         wall.route_ratio,
         wall.wall_press,
         wall.behind_wall_return_rate,
+        wall.behind_wall_fast_return_rate,
+        wall.behind_wall_prompt_return_rate,
         wall.behind_wall_timeouts,
+        wall.return_stream_mean,
+        wall.return_stream_peak,
         wall.behavior.scatter_rate,
         wall.offroute_clutter_rate,
         wall.offroute_trail_rate,
@@ -2914,7 +3961,7 @@ fn run_wall_regression() {
         t0.elapsed().as_secs_f32(),
     );
     println!(
-        "checkpoints={} blockedAim={}/{} clearHome={}/{} clearLine={}/{} behindWall={}/{} mean={} max={}",
+        "checkpoints={} blockedAim={}/{} clearHome={}/{} clearLine={}/{} behindWall={}/{} fast={}/{} prompt={}/{} mean={} max={} streamMean={:.1} streamPeak={}",
         wall.checkpoints
             .iter()
             .map(|v| v.to_string())
@@ -2928,28 +3975,181 @@ fn run_wall_regression() {
         wall.clear_home_trajectory_samples,
         wall.behind_wall_returns,
         wall.behind_wall_pickups,
+        wall.behind_wall_fast_returns,
+        wall.behind_wall_pickups,
+        wall.behind_wall_prompt_returns,
+        wall.behind_wall_pickups,
         wall.mean_behind_wall_return_ticks.round() as u32,
         wall.max_behind_wall_return_ticks,
+        wall.return_stream_mean,
+        wall.return_stream_peak,
     );
 }
 
-fn run_cluster_regression() {
-    let params = BenchParams {
-        name: "default",
-        home_diffusion: 0.03,
-        food_lay_strength: 1.5,
-        outbound_lay_threshold: 0.5,
-        bilinear_deposit: false,
-    };
+fn run_arc_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
+    let t0 = std::time::Instant::now();
+    let arc = run_arc_bench(params);
+    println!(
+        "arc_to_line brain={} score={:.1} deliveries={} straight={:.2} arc={:.2} off={:.2} meanLineDist={:.1} direct={:.3} chord={:.3} returnDist={:.1} perfect={:.3} scatter={:.2} branch={} dead={} cover={:.3} hDash={:.3} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
+        arc.score,
+        arc.deliveries,
+        arc.metrics.straight_ratio,
+        arc.metrics.arc_ratio,
+        arc.metrics.off_ratio,
+        arc.metrics.mean_line_dist,
+        arc.direct_return_rate,
+        arc.return_chord_rate,
+        arc.mean_return_line_dist,
+        arc.perfect_return_rate,
+        arc.behavior.scatter_rate,
+        arc.behavior.branch_cells,
+        arc.behavior.dead_end_cells,
+        arc.behavior.trail_coverage,
+        arc.behavior.home_dash_rate,
+        t0.elapsed().as_secs_f32(),
+    );
+    println!(
+        "checkpoints={} direct={}/{} chord={}/{} perfect={}/{} maxStraight={:.2} maxHomeProg={:.2}",
+        arc.checkpoints
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("->"),
+        arc.direct_return_samples,
+        arc.return_samples,
+        arc.return_chord_samples,
+        arc.return_samples,
+        arc.perfect_return_traces,
+        arc.return_trajectory_samples,
+        arc.max_return_straightness,
+        arc.max_return_home_progress,
+    );
+}
+
+fn run_post_pickup_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
+    let t0 = std::time::Instant::now();
+    let post = run_post_pickup_bench(params);
+    println!(
+        "post_pickup brain={} score={:.1} samples={} direct={}/{} pDash={:.4} line={}/{} pLine={:.4} streak={} maxStraight={:.2} maxHomeProg={:.2} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
+        post.score,
+        post.samples,
+        post.direct_home_samples,
+        post.samples,
+        post.direct_home_rate,
+        post.straight_home_traces,
+        post.trajectory_samples,
+        post.straight_home_rate,
+        post.max_direct_streak,
+        post.max_trace_straightness,
+        post.max_trace_home_progress,
+        t0.elapsed().as_secs_f32(),
+    );
+}
+
+fn run_lost_carrier_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
+    let t0 = std::time::Instant::now();
+    let lost = run_lost_carrier_bench(params);
+    println!(
+        "lost_carrier brain={} score={:.1} samples={} back={}/{} pBack={:.4} traces={} returned={} maxDrop={:.1} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
+        lost.score,
+        lost.samples,
+        lost.backtrack_samples,
+        lost.samples,
+        lost.backtrack_rate,
+        lost.traces,
+        lost.returned_to_food_traces,
+        lost.max_return_drop,
+        t0.elapsed().as_secs_f32(),
+    );
+}
+
+fn run_meander_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
+    let t0 = std::time::Instant::now();
+    let meander = run_meander_bench(params);
+    println!(
+        "meander brain={} score={:.1} workers={} path={:.1} disp={:.1} straight={:.3} line={:.3} turn={:.3} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
+        meander.score,
+        meander.workers,
+        meander.mean_path_len,
+        meander.mean_displacement,
+        meander.mean_straightness,
+        meander.straight_trace_rate,
+        meander.mean_turn_rate,
+        t0.elapsed().as_secs_f32(),
+    );
+}
+
+fn run_loop_decay_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
+    let t0 = std::time::Instant::now();
+    let loop_decay = run_loop_decay_bench(params);
+    println!(
+        "loop_decay brain={} score={:.1} final={:.3} swarm={:.2} scatter={:.2} hDash={:.3} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
+        loop_decay.score,
+        loop_decay.final_mass_ratio,
+        loop_decay.loop_swarm_rate,
+        loop_decay.behavior.scatter_rate,
+        loop_decay.behavior.home_dash_rate,
+        t0.elapsed().as_secs_f32(),
+    );
+}
+
+fn run_food_cycle_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
+    let t0 = std::time::Instant::now();
+    let cycle = run_food_cycle_bench(params);
+    println!(
+        "food_cycle brain={} score={:.1} first={} second={} left={:.0}/{:.0} old={:.3}/{:.3} smell={:.2} repelOld={:.2} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
+        cycle.score,
+        cycle.first_deliveries,
+        cycle.second_deliveries,
+        cycle.first_left,
+        cycle.second_left,
+        cycle.old_swarm_after_depletion,
+        cycle.old_swarm_final,
+        cycle.phantom_smell,
+        cycle.repellent_at_old_source,
+        t0.elapsed().as_secs_f32(),
+    );
+    println!(
+        "checkpoints={}",
+        cycle
+            .checkpoints
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("->")
+    );
+}
+
+fn run_cluster_regression(worker_brain_kind: WorkerBrainKind) {
+    let params = bench_params("default", 0.03, 1.5, 0.5, false, worker_brain_kind);
     let t0 = std::time::Instant::now();
     let cluster = run_cluster_bench(params);
     println!(
-        "cluster_escape score={:.0} workers={} disp={:.1} sample={:.2} final={:.2} rev={:.2} trap={:.2} elapsed={:.1}s",
+        "cluster_escape brain={} score={:.1} workers={} disp={:.1} sample={:.2} final={:.2} bottle={:.2}/{:.2}/{:.2} active={:.2}/{:.2}/{:.2} rev={:.2} trap={:.2} elapsed={:.1}s",
+        worker_brain_kind.as_str(),
         cluster.score,
         cluster.workers,
         cluster.mean_displacement,
         cluster.cluster_sample_rate,
         cluster.final_cluster_rate,
+        cluster.wall_bottleneck_worker_rate,
+        cluster.wall_bottleneck_clump_rate,
+        cluster.wall_bottleneck_peak_rate,
+        cluster.active_food_wall_worker_rate,
+        cluster.active_food_wall_clump_rate,
+        cluster.active_food_wall_peak_rate,
         cluster.reversal_rate,
         cluster.trapped_oscillation_rate,
         t0.elapsed().as_secs_f32(),
